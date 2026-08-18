@@ -11,6 +11,12 @@ DEVELOPER_TEAM = ##TEAM_ID##
 // For example: myOwnApp.$(DEVELOPMENT_TEAM).trio
 BUNDLE_IDENTIFIER = org.nightscout.$(DEVELOPMENT_TEAM).trio
 
+// Space-separated Swift compilation flags applied to every build of the Trio app.
+// For example, set to DEV_BRANCH_WARNING_DISABLED to silence the "not built from
+// main" startup alert (shown automatically on any build made from a branch other
+// than main). Leave blank to keep the default behavior.
+CUSTOM_SWIFT_FLAGS = DEV_BRANCH_WARNING_DISABLED
+
 // Danger zone - do not modify these unless you know what you are doing
 
 // The TRIO_APP_GROUP_ID should not be modified - it is required to have this exact format
