@@ -73,6 +73,12 @@ struct TrioSettings: JSON, Equatable, Encodable {
     var homeStatsPanelFace: HomeStatsPanelFace = .timeInRange
     var requireAdjustmentsConfirmation: Bool = false
 
+    /// Whether a hardware volume-button press (while a critical alarm's own audio is
+    /// sounding) snoozes that alarm for 15 minutes. Off by default: an ordinary
+    /// volume-down press (e.g. during a call, or adjusting media volume) could
+    /// otherwise silence a genuine urgent-low alarm without the user meaning to.
+    var useVolumeButtonSnooze: Bool = false
+
     /// Selected Garmin watchface (Trio or SwissAlpine)
     var garminWatchface: GarminWatchface = .trio
     var garminDatafield: GarminDatafield = .none
@@ -279,6 +285,10 @@ extension TrioSettings: Decodable {
 
         if let rulerMarks = try? container.decode(Bool.self, forKey: .rulerMarks) {
             settings.rulerMarks = rulerMarks
+        }
+
+        if let useVolumeButtonSnooze = try? container.decode(Bool.self, forKey: .useVolumeButtonSnooze) {
+            settings.useVolumeButtonSnooze = useVolumeButtonSnooze
         }
 
         if let bolusDisplayThreshold = try? container.decode(BolusDisplayThreshold.self, forKey: .bolusDisplayThreshold) {
