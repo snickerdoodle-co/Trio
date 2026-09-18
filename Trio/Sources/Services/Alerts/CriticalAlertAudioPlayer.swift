@@ -10,6 +10,9 @@ final class CriticalAlertAudioPlayer {
 
     private var player: AVAudioPlayer?
     private var vibrationTimer: Timer?
+    private var volumeObservation: NSKeyValueObservation?
+    private var onVolumeButtonPressed: (() -> Void)?
+    private var hasTriggeredVolumeSnooze = false
 
     private let vibrationInterval: TimeInterval = 2.0
     /// System volume floor for critical alarms. The alarm has to be audible
@@ -27,9 +30,15 @@ final class CriticalAlertAudioPlayer {
     /// LoopFollow / Jonas loop-failure alarm. `.playback` audio session gives
     /// the app a privileged background state so the alarm continues even if
     /// the user has the screen locked.
-    func play(soundNamed soundName: String = "critical.caf") {
+    ///
+    /// - Parameter onVolumeButtonPressed: Invoked (once per playback, on the
+    ///   main thread) if a hardware volume-button press is detected while
+    ///   this alarm is sounding — see `startVolumeButtonObservation`.
+    func play(soundNamed soundName: String = "critical.caf", onVolumeButtonPressed: (() -> Void)? = nil) {
         stop()
 
+        self.onVolumeButtonPressed = onVolumeButtonPressed
+        hasTriggeredVolumeSnooze = false
         startVibration()
 
         let resource = (soundName as NSString).deletingPathExtension
@@ -59,6 +68,7 @@ final class CriticalAlertAudioPlayer {
             try session.setCategory(.playback, mode: .default, options: [.duckOthers, .mixWithOthers])
             try session.setActive(true, options: [])
             volumeBooster.boost(to: minimumSystemVolume)
+            startVolumeButtonObservation(session: session)
 
             let p = try AVAudioPlayer(contentsOf: url)
             p.numberOfLoops = -1
@@ -83,6 +93,34 @@ final class CriticalAlertAudioPlayer {
         }
     }
 
+    /// Lets the user snooze the currently-sounding alarm with a hardware
+    /// volume button instead of unlocking the phone and opening Trio.
+    /// `AVAudioSession.outputVolume` only delivers KVO changes to an app
+    /// holding an active audio session, so this observation is only ever
+    /// live while our own critical audio is actually playing — it's torn
+    /// down again in `stop()`.
+    ///
+    /// Two caveats worth knowing: `SystemVolumeBooster` already pushes the
+    /// system volume to max the moment this alarm starts, so a volume-UP
+    /// press has no headroom left to register a change — in practice only
+    /// volume-DOWN reliably triggers this. And there's no public API to
+    /// intercept the button without also moving the real system volume, so
+    /// the press will audibly/visibly change it as a side effect.
+    private func startVolumeButtonObservation(session: AVAudioSession) {
+        volumeObservation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.handleVolumeButtonPress()
+            }
+        }
+    }
+
+    private func handleVolumeButtonPress() {
+        guard !hasTriggeredVolumeSnooze else { return }
+        hasTriggeredVolumeSnooze = true
+        os_log("Volume button pressed during critical alarm playback — triggering snooze", log: log, type: .info)
+        onVolumeButtonPressed?()
+    }
+
     /// Stop playback if any. Safe to call when not playing.
     func stop() {
         guard player != nil || vibrationTimer != nil else { return }
@@ -90,6 +128,9 @@ final class CriticalAlertAudioPlayer {
         player = nil
         vibrationTimer?.invalidate()
         vibrationTimer = nil
+        volumeObservation?.invalidate()
+        volumeObservation = nil
+        onVolumeButtonPressed = nil
         volumeBooster.restore()
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
         os_log("Stopped critical-alert audio playback", log: log, type: .info)
