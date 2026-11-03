@@ -5,6 +5,8 @@ enum MultiUsePanelState: Equatable {
     case notificationsDisabled
     case pumpTimeMismatch
     case cgmStale
+    /// What the pump delivered in an untethered session and what the complete history says still differ.
+    case untetheredAudit(String)
     case maxIOBZero
     case whatsNew
     case dosingModeLimited(DosingMode)
@@ -20,11 +22,14 @@ enum MultiUsePanelState: Equatable {
         maxIOB: Decimal,
         hasUnacknowledgedReleaseNotes: Bool,
         dosingMode: DosingMode,
+        untetheredAuditFinding: String? = nil,
         now: Date
     ) -> MultiUsePanelState {
         if notificationsDisabled { return .notificationsDisabled }
         if pumpTimeMismatch { return .pumpTimeMismatch }
         if now.timeIntervalSince(lastGlucoseDate ?? .distantPast) > cgmStaleAfter { return .cgmStale }
+        // insulin on board may be off: ahead of the standing settings below, which would hide it for good
+        if let untetheredAuditFinding { return .untetheredAudit(untetheredAuditFinding) }
         // constrained modes clamp Max IOB to 0 without touching the stored value
         if dosingMode.automation == .reductionsOnly || dosingMode.automation == .hypoSuspendOnly {
             return .dosingModeLimited(dosingMode)

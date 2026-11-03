@@ -67,6 +67,16 @@ struct AppShortcuts: AppShortcutsProvider {
             systemImageName: "xmark.circle.fill"
         )
         AppShortcut(
+            intent: StartUntetheredIntent(),
+            phrases: [
+                "Start \(.applicationName) untethered mode",
+                "Hand the pump to the watch in \(.applicationName)"
+            ],
+            shortTitle: "Start Untethered",
+            // not "applewatch": App Store Connect refuses "apple" in App Intent metadata
+            systemImageName: "figure.run"
+        )
+        AppShortcut(
             intent: RestartLiveActivityIntent(),
             phrases: [
                 "Restart \(.applicationName) Live Activity",

@@ -14,7 +14,8 @@ import Testing
         lastGlucoseDate: Date?,
         maxIOB: Decimal = 10,
         hasUnacknowledgedReleaseNotes: Bool = false,
-        dosingMode: DosingMode = .closed
+        dosingMode: DosingMode = .closed,
+        untetheredAuditFinding: String? = nil
     ) -> MultiUsePanelState {
         MultiUsePanelState.resolve(
             notificationsDisabled: notificationsDisabled,
@@ -23,8 +24,23 @@ import Testing
             maxIOB: maxIOB,
             hasUnacknowledgedReleaseNotes: hasUnacknowledgedReleaseNotes,
             dosingMode: dosingMode,
+            untetheredAuditFinding: untetheredAuditFinding,
             now: now
         )
+    }
+
+    @Test("An untethered audit finding yields to stale glucose, outranks the standing settings") func testUntetheredAudit() {
+        let finding = "The records show 0.87 U more insulin than the pump delivered. Insulin on board may be overstated."
+        #expect(resolve(lastGlucoseDate: stale, untetheredAuditFinding: finding) == .cgmStale)
+        #expect(
+            resolve(lastGlucoseDate: fresh, maxIOB: 0, dosingMode: .lowGlucoseSuspend, untetheredAuditFinding: finding)
+                == .untetheredAudit(finding)
+        )
+        #expect(
+            resolve(lastGlucoseDate: fresh, hasUnacknowledgedReleaseNotes: true, untetheredAuditFinding: finding)
+                == .untetheredAudit(finding)
+        )
+        #expect(resolve(lastGlucoseDate: fresh, untetheredAuditFinding: nil) == .stats)
     }
 
     @Test("Constrained modes announce themselves even with a non-zero stored Max IOB") func testDosingModeLimited() {

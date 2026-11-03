@@ -3,10 +3,44 @@ import SwiftUI
 import WatchKit
 
 struct TrioMainWatchView: View {
-    @State private var state = WatchState()
+    /// Extended Untethered Mode shows its minimal screen on each wrist raise until tapped.
+    @State private var showsFullApp = false
+    /// Since when Trio is inactive (wrist turned, a notification); 20 s of it bring the minimal screen back.
+    @State private var glanceInactiveSince: Date?
+    @Environment(\.scenePhase) private var glanceScenePhase
+    @State private var state = WatchState.shared
+    @State private var untethered = UntetheredWatchManager.shared
+
+    // Pages in order: bubble, chart, devices (pump and sensor lifetime), alarm snooze, untethered mode's status page
+    // (start, hand back, history, the log), the watch's own G7 reader (its switch), and last, while it loops, the
+    // watch's own loop status.
+    private let devicesPage = 2
+    private let snoozePage = 3
+    /// Untethered mode off on the phone: no status page, but a session still running keeps it.
+    private var showsUntethered: Bool { state.untetheredMode || untethered.isActive }
+    private var statusPage: Int { snoozePage + 1 }
+    /// The watch's own loop status, while it loops.
+    private var watchSensorPage: Int { (showsUntethered ? statusPage : snoozePage) + 1 }
+    /// Last, while it loops.
+    private var loopPage: Int? { untethered.isActive ? watchSensorPage + 1 : nil }
+    private var lastPage: Int { loopPage ?? watchSensorPage }
+
+    /// While the watch runs the pod and the sensor, the Devices page shows them as the watch sees them.
+    private var ownDevices: WatchOwnDevices? {
+        guard untethered.isActive else { return nil }
+        return WatchOwnDevices(
+            reservoir: watchPumpReservoir(untethered.pumpManager) ?? untethered.data.reservoir,
+            expiresAt: watchPumpExpiresAt(untethered.pumpManager),
+            activatedAt: watchPumpActivatedAt(untethered.pumpManager),
+            sensorExpiresAt: watchCGMExpiresAt(untethered.cgmManager)
+        )
+    }
 
     // misc
     @State private var currentPage: Int = 0
+    /// Scrubbing the chart with the crown (see GlucoseChartView).
+    @State private var isScrubbingChart = false
+    @State private var chartScrubSteps = 0.0
     @State private var rotationDegrees: Double = 0.0
     @State private var showingTempTargetSheet = false
 
@@ -29,6 +63,11 @@ struct TrioMainWatchView: View {
         let secondsSinceUpdate = now - lastUpdateTimestamp
         // Return true if last update older than 5 min, so 1 loop cycle
         return secondsSinceUpdate > 5 * 60
+    }
+
+    /// Treatments and IOB/COB rely on the phone's data, unless the watch runs the loop itself.
+    private var isPhoneDataUnusable: Bool {
+        !untethered.isActive && (isWatchStateDated || isSessionUnreachable)
     }
 
     var isSessionUnreachable: Bool {
@@ -60,15 +99,50 @@ struct TrioMainWatchView: View {
     )
 
     var body: some View {
+        Group {
+            if untethered.isKeptAwake, state.glanceEnabled, !showsFullApp {
+                UntetheredGlanceView(state: state, manager: untethered) {
+                    // The pages change while the minimal screen shows (a session's loop page comes and goes), and the
+                    // full app's own corrections only run while it is on screen: a page that no longer existed opened
+                    // as an empty screen with no way out (25 October, second user). A tap opens the untethered page,
+                    // with the hand-back, which is what it is usually for.
+                    currentPage = showsUntethered ? statusPage : 0
+                    showsFullApp = true
+                }
+            } else {
+                fullApp
+            }
+        }
+        .onChange(of: glanceScenePhase) { _, phase in
+            // back to the minimal screen once the app has been away for a while, not at every brief inactive moment
+            // (a turned wrist, a notification): the way to the hand-back button must not close behind you
+            if phase == .background { showsFullApp = false }
+            if phase == .active { glanceInactiveSince = nil }
+            if phase == .inactive {
+                let since = Date()
+                glanceInactiveSince = since
+                DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+                    if glanceInactiveSince == since { showsFullApp = false }
+                }
+            }
+        }
+    }
+
+    private var fullApp: some View {
         NavigationStack(path: $navigationPath) {
             TabView(selection: $currentPage) {
                 // Page 1: Current glucose trend in "BG bobble"
                 ZStack {
-                    GlucoseTrendView(
-                        state: state,
-                        rotationDegrees: rotationDegrees,
-                        isWatchStateDated: isWatchStateDated || isSessionUnreachable
-                    )
+                    // Re-evaluated every 15 s: "stale" and "the watch has a newer
+                    // reading" depend on the clock, not only on new data, so the
+                    // bubble switches as soon as the phone's data ages out.
+                    TimelineView(.periodic(from: .now, by: 15)) { _ in
+                        GlucoseTrendView(
+                            state: state,
+                            rotationDegrees: rotationDegrees,
+                            isWatchStateDated: isWatchStateDated || isSessionUnreachable
+                        )
+                    }
 
                     if state.showSyncingAnimation {
                         Image(systemName: "iphone.radiowaves.left.and.right")
@@ -90,15 +164,54 @@ struct TrioMainWatchView: View {
                 // Page 2: Glucose chart
                 GlucoseChartView(
                     state: state,
-                    glucoseValues: state.glucoseValues
+                    glucoseValues: state.glucoseValues,
+                    isScrubbing: $isScrubbingChart,
+                    scrubSteps: $chartScrubSteps
                 )
                 .tag(1)
 
-                // Page 3: Alarm snooze
+                // Page 3: pump and sensor lifetime (EJM0/Trio's Devices page, Elias Maurer)
+                PeripheralsView(
+                    state: state,
+                    isWatchStateDated: isWatchStateDated || isSessionUnreachable,
+                    own: ownDevices
+                )
+                .tag(devicesPage)
+
+                // Page 4: alarm snooze (nightscout/Trio#1576, t1dude)
                 AlarmSnoozeView(state: state)
-                    .tag(2)
+                    .tag(snoozePage)
+
+                if showsUntethered {
+                    UntetheredStatusView(manager: untethered).tag(statusPage)
+                }
+                // the watch reading the G7 itself, its switch and log
+                WatchG7View()
+                    .tag(watchSensorPage)
+
+                // Last, while it loops: the watch's own loop status
+                if let loopPage {
+                    UntetheredLoopStatusView(manager: untethered).tag(loopPage)
+                }
+            }
+            .onChange(of: untethered.isActive) { _, isActive in
+                // to the status page as a session starts, and from the loop page to it as the session ends
+                if isActive || currentPage == watchSensorPage + 1 { currentPage = statusPage }
+            }
+            // the pairing note is on the status page
+            .onChange(of: untethered.isPairingSensor) { _, isPairing in
+                if isPairing { currentPage = statusPage }
+            }
+            // the loop page goes with the session; stay on the status page, not on none
+            .onChange(of: lastPage) { _, _ in
+                if currentPage > lastPage { currentPage = lastPage }
+            }
+            .onChange(of: showsUntethered) { _, _ in
+                if currentPage > lastPage { currentPage = lastPage }
             }
             .onAppear {
+                // a page left over from before the minimal screen, or from another set of pages, shows nothing
+                if currentPage < 0 || currentPage > lastPage { currentPage = 0 }
                 /// Hard reset variables when main view appears
                 /// Reset `bolusAmount` and `recommendedBolus` to ensure no stale / old value is set when user opens bolus input or meal combo the next time.
                 state.bolusAmount = 0
@@ -106,7 +219,8 @@ struct TrioMainWatchView: View {
             }
             .background(trioBackgroundColor)
             .tabViewStyle(.verticalPage)
-            .digitalCrownRotation($currentPage.doubleBinding(), from: 0, through: 2, by: 1)
+            .digitalCrownRotation($currentPage.doubleBinding(), from: 0, through: Double(lastPage), by: 1)
+            .modifier(ChartScrubEnd(isScrubbing: $isScrubbingChart, scrubSteps: $chartScrubSteps, currentPage: currentPage))
             .onChange(of: state.trend) { _, newTrend in
                 withAnimation {
                     updateRotation(for: newTrend)
@@ -116,9 +230,10 @@ struct TrioMainWatchView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     VStack {
                         Image(systemName: "syringe.fill")
+                            .font(.system(size: 15))
                             .foregroundStyle(Color.insulin)
 
-                        Text(isWatchStateDated || isSessionUnreachable ? "--" : state.iob ?? "--")
+                        Text(isPhoneDataUnusable ? "--" : state.iob ?? "--")
                             .foregroundStyle(isWatchStateDated ? Color.secondary : Color.white)
                             .frame(alignment: .leading)
                             .minimumScaleFactor(0.5)
@@ -128,43 +243,55 @@ struct TrioMainWatchView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     VStack {
                         Image(systemName: "fork.knife")
+                            .font(.system(size: 15))
                             .foregroundStyle(Color.orange)
 
-                        Text(isWatchStateDated || isSessionUnreachable ? "--" : state.cob ?? "--")
-                            .foregroundStyle(isWatchStateDated || isSessionUnreachable ? Color.secondary : Color.white)
+                        Text(isPhoneDataUnusable ? "--" : state.cob ?? "--")
+                            .foregroundStyle(isPhoneDataUnusable ? Color.secondary : Color.white)
                             .frame(alignment: .trailing)
                             .minimumScaleFactor(0.5)
                     }.font(.caption2)
                 }
 
                 ToolbarItemGroup(placement: .bottomBar) {
-                    Button {
-                        showingOverrideSheet = true
-                    } label: {
-                        Image(systemName: "clock.arrow.2.circlepath")
-                            .foregroundStyle(Color.primary, isOverrideActive ? Color.primary : Color.purple)
-                    }
-                    .tint(isOverrideActive ? Color.purple : nil)
-                    .disabled(isWatchStateDated || isSessionUnreachable)
+                    if currentPage == 0 {
+                        // treatments, overrides and temp targets on the first page only; the chart gets the room
+                        Button {
+                            showingOverrideSheet = true
+                        } label: {
+                            Image(systemName: "clock.arrow.2.circlepath")
+                                .foregroundStyle(Color.primary, isOverrideActive ? Color.primary : Color.purple)
+                        }
+                        .tint(isOverrideActive ? Color.purple : nil)
+                        .disabled(isPhoneDataUnusable)
 
-                    Button {
-                        showingTreatmentMenuSheet = true
-                    } label: {
-                        Image(systemName: "plus")
-                            .foregroundStyle(Color.bgDarkerDarkBlue)
-                    }
-                    .controlSize(.large)
-                    .buttonStyle(WatchOSButtonStyle(deviceType: state.deviceType))
-                    .disabled(isWatchStateDated || isSessionUnreachable)
+                        // while the watch's pump delivers a bolus, the button stops it
+                        Button {
+                            if untethered.isBolusing {
+                                untethered.cancelBolus()
+                            } else {
+                                showingTreatmentMenuSheet = true
+                            }
+                        } label: {
+                            Image(systemName: untethered.isBolusing ? "square.fill" : "plus")
+                                .foregroundStyle(Color.bgDarkerDarkBlue)
+                        }
+                        .controlSize(.large)
+                        .buttonStyle(WatchOSButtonStyle(deviceType: state.deviceType))
+                        .overlay {
+                            if untethered.isBolusing { BolusProgressRing(window: untethered.bolusWindow) }
+                        }
+                        .disabled(!untethered.isBolusing && isPhoneDataUnusable)
 
-                    Button {
-                        showingTempTargetSheet = true
-                    } label: {
-                        Image(systemName: "target")
-                            .foregroundStyle(isTempTargetActive ? Color.primary : Color.loopGreen.opacity(0.75))
+                        Button {
+                            showingTempTargetSheet = true
+                        } label: {
+                            Image(systemName: "target")
+                                .foregroundStyle(isTempTargetActive ? Color.primary : Color.loopGreen.opacity(0.75))
+                        }
+                        .tint(isTempTargetActive ? Color.loopGreen.opacity(0.75) : nil)
+                        .disabled(isPhoneDataUnusable)
                     }
-                    .tint(isTempTargetActive ? Color.loopGreen.opacity(0.75) : nil)
-                    .disabled(isWatchStateDated || isSessionUnreachable)
                 }
             }
             .fullScreenCover(isPresented: $showingTreatmentMenuSheet) {
@@ -272,4 +399,33 @@ struct TrioMainWatchView: View {
 
 #Preview {
     TrioMainWatchView()
+}
+
+/// Ends the chart's scrubbing (GlucoseChartView), which then hands the crown back to the pages: by turning the
+/// crown back past now, after 10 seconds without a turn, or on leaving the chart page. A tap on the chart ends it too.
+struct ChartScrubEnd: ViewModifier {
+    @Binding var isScrubbing: Bool
+    @Binding var scrubSteps: Double
+    let currentPage: Int
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: scrubSteps) { _, steps in
+                if isScrubbing, steps < 0 { stop() }
+            }
+            .onChange(of: currentPage) { _, page in
+                if page != 1, isScrubbing { stop() }
+            }
+            // restarts with every turn; 10 s still ends it
+            .task(id: isScrubbing ? scrubSteps : -2) {
+                guard isScrubbing else { return }
+                try? await Task.sleep(for: .seconds(10))
+                if !Task.isCancelled, isScrubbing { stop() }
+            }
+    }
+
+    private func stop() {
+        withAnimation { isScrubbing = false }
+        scrubSteps = 0
+    }
 }

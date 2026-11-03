@@ -891,7 +891,8 @@ extension Home {
         /// Sensor expiration for the home label. Prefers manager-reported
         /// dates; reverse-derives from `lifecycle.percentComplete` when not.
         /// `activatedAt` must be session start, not transmitter activation.
-        private static func resolveSensorExpiresAt(
+        /// Also what the watch's Devices page counts down to (`AppleWatchManager.peripheralDetails`).
+        static func resolveSensorExpiresAt(
             manager: CGMManagerUI?,
             glucoseSource: GlucoseSource?
         ) -> Date? {

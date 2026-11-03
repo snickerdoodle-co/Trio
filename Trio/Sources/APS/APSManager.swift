@@ -20,6 +20,9 @@ protocol APSManager {
     var pumpName: CurrentValueSubject<String, Never> { get }
     var isLooping: CurrentValueSubject<Bool, Never> { get }
     var lastLoopDate: Date { get }
+    /// The untethered hand-back carries the watch's last loop over: the loop's age and the minimum interval to the
+    /// next loop both count from it, so the phone doesn't loop again straight away.
+    func adoptLoop(at date: Date)
     var lastLoopDateSubject: PassthroughSubject<Date, Never> { get }
     var bolusProgress: CurrentValueSubject<Decimal?, Never> { get }
     var pumpExpiresAtDate: CurrentValueSubject<Date?, Never> { get }
@@ -135,6 +138,13 @@ final class BaseAPSManager: APSManager, Injectable {
     @Injected() private var broadcaster: Broadcaster!
     @Injected() private var trioAlertManager: TrioAlertManager!
     @Persisted(key: "lastLoopStartDate") private var lastLoopStartDate: Date = .distantPast
+
+    func adoptLoop(at date: Date) {
+        guard date > lastLoopDate else { return }
+        lastLoopStartDate = date
+        lastLoopDate = date
+    }
+
     private var lastDosingMode: DosingMode?
     @Persisted(key: "lastLoopDate") var lastLoopDate: Date = .distantPast {
         didSet {
@@ -308,6 +318,11 @@ final class BaseAPSManager: APSManager, Injectable {
                 return
             }
 
+            guard UntetheredGate.phoneMayDose else {
+                debug(.loop, "The watch is in charge of the pump (untethered) — skipping loop attempt")
+                return
+            }
+
             // Atomic check-and-set via actor — eliminates the race between
             // checking isLooping.value and sending isLooping(true).
             guard await loopGuard.tryStart(
@@ -442,6 +457,9 @@ final class BaseAPSManager: APSManager, Injectable {
         guard let pump = pumpManager else {
             return APSError.invalidPumpState(message: String(localized: "Pump not set"))
         }
+        guard UntetheredGate.phoneMayDose else {
+            return APSError.invalidPumpState(message: String(localized: "The watch is in charge of the pump"))
+        }
         let status = pump.status.pumpStatus
 
         guard !status.bolusing else {
@@ -461,9 +479,8 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     func autosense() async throws -> Bool {
-        guard let autosense = await storage.retrieveAsync(OpenAPS.Settings.autosense, as: Autosens.self),
-              (autosense.timestamp ?? .distantPast).addingTimeInterval(30.minutes.timeInterval) > Date()
-        else {
+        let autosense = await storage.retrieveAsync(OpenAPS.Settings.autosense, as: Autosens.self)
+        guard OrefPipeline.autosensIsCurrent(autosense, now: Date()) else {
             let result = try await openAPS.autosense(
                 shouldSmoothGlucose: settingsManager.settings.smoothGlucose
             )
@@ -487,7 +504,7 @@ final class BaseAPSManager: APSManager, Injectable {
         )
 
         // Store TDD in Core Data
-        await tddStorage.storeTDD(tddResult)
+        await tddStorage.storeTDD(tddResult, at: Date())
     }
 
     func determineBasal() async throws {
@@ -585,6 +602,8 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     func determineBasalSync() async throws {
+        // the watch's determinations arrive with its history
+        guard UntetheredGate.phoneMayDose else { return }
         await loopGuard.waitForLoop()
         guard await loopGuard.tryStartStandaloneDetermination() else {
             debug(.loop, "Standalone determination skipped: one is already running")
@@ -680,11 +699,16 @@ final class BaseAPSManager: APSManager, Injectable {
         } catch let bolusError {
             error(.bolus, "Bolus of \(roundedAmount) U failed", error: bolusError)
             lastError.send(APSError.pumpError(bolusError))
+            // with the iPhone's Bluetooth off the pump reads as "not connected": say why (28 October, flight mode)
+            let bluetoothOff = await MainActor.run { self.bluetoothManager?.bluetoothState == .poweredOff }
+            let reason = bluetoothOff
+                ? String(localized: "The iPhone's Bluetooth is off, so it couldn't reach the pump.")
+                : bolusError.localizedDescription
             issueAlertForCategory(
                 .bolusFailed,
                 title: String(localized: "Bolus failed"),
                 body: String(localized: "Check pump history before repeating.")
-                    + "\n\n\(bolusError.localizedDescription)"
+                    + "\n\n\(reason)"
             )
             if !isSMB {
                 let broadcaster = self.broadcaster
@@ -696,7 +720,7 @@ final class BaseAPSManager: APSManager, Injectable {
             }
             callback?(
                 false,
-                String(localized: "Error! Bolus failed with error: \(bolusError.localizedDescription)")
+                String(localized: "Error! Bolus failed with error: \(reason)")
             )
         }
     }
@@ -1499,6 +1523,8 @@ extension BaseAPSManager: SettingsObserver {
 
         // Only basal testing clears a running temp. Elsewhere it may be protecting against a low,
         // and dropping back to scheduled basal would remove that protection.
+        // If the watch owns the pump, its loop performs this cleanup on the watch instead.
+        guard UntetheredGate.phoneMayDose else { return }
         guard settings.dosingMode == .basalTesting, previous != .basalTesting else { return }
 
         Task { await cancelAutomaticTempBasal() }

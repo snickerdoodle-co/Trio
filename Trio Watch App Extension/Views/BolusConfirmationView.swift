@@ -81,7 +81,7 @@ struct BolusConfirmationView: View {
 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     if state.carbsAmount > 0 {
-                        state.sendCarbsRequest(state.carbsAmount, Date())
+                        state.sendCarbsRequest(state.carbsAmount, Date(), acknowledge: false)
                         state.carbsAmount = 0 // reset carbs in state
                     }
                     state.sendBolusRequest(Decimal(bolusAmount))

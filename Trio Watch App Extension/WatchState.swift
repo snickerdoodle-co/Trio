@@ -1,10 +1,15 @@
 import Foundation
 import SwiftUI
+import UserNotifications
 import WatchConnectivity
 
 /// WatchState manages the communication between the Watch app and the iPhone app using WatchConnectivity.
 /// It handles glucose data synchronization and sending treatment requests (bolus, carbs) to the phone.
 @Observable final class WatchState: NSObject, WCSessionDelegate {
+    /// The one instance the screens and the untethered mode share, so data the watch produces itself
+    /// reaches the same screens as the phone's.
+    static let shared = WatchState()
+
     // MARK: - Properties
 
     /// The WatchConnectivity session instance used for communication
@@ -29,6 +34,21 @@ import WatchConnectivity
     var tempTargetPresets: [TempTargetPresetWatch] = []
     var snoozeUntilDate: Date = .distantPast
 
+    // Devices page (PeripheralsView): pump and sensor lifetime from the phone; nil where the hardware reports none
+    var pumpName: String?
+    var pumpReservoir: Decimal?
+    var pumpBatteryPercent: Int?
+    var pumpExpiresAt: Date?
+    var pumpActivatedAt: Date?
+    var pumpStatusMessage: String?
+    var cgmName: String?
+    var cgmSensorExpiresAt: Date?
+    var cgmProgressPercent: Double?
+    var cgmProgressState: String?
+    var cgmStatusMessage: String?
+    /// The phone has sent device data at least once: before that the page shows it's loading.
+    var hasReceivedPeripheralData = false
+
     /// treatments inputs
     /// used to store carbs for combined meal-bolus-treatments
     var carbsAmount: Int = 0
@@ -47,13 +67,105 @@ import WatchConnectivity
     var bolusIncrement: Decimal = 0.05
     var confirmBolusFaster: Bool = false
 
+    /// Settings › Apple Watch › Untethered Mode, as the phone last sent it; kept, so it holds while the phone is away.
+    /// On until the phone says otherwise.
+    var untetheredMode: Bool = UserDefaults.standard.object(forKey: WatchMessageKeys.untetheredModeWatch) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(untetheredMode, forKey: WatchMessageKeys.untetheredModeWatch) }
+    }
+
     // Forecast options
-    var showForecast: Bool = false
-    var isForecastCone: Bool = false
+    // Kept across launches: untethered with the phone away, no update brings them back after watchOS ended the app.
+    var showForecast: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.showForecastWatch) {
+        didSet { UserDefaults.standard.set(showForecast, forKey: WatchMessageKeys.showForecastWatch) }
+    }
+
+    var isForecastCone: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.isForecastCone) {
+        didSet { UserDefaults.standard.set(isForecastCone, forKey: WatchMessageKeys.isForecastCone) }
+    }
+
     var forecastStartDate: Date?
     var forecastConeMin: [Double] = []
     var forecastConeMax: [Double] = []
     var forecastLines: [String: [Double]] = [:] // "iob" / "cob" / "uam" / "zt" -> values
+    /// Boluses and carbs on the chart, untethered only: the watch has its own history then.
+    var treatmentMarkers: [WatchTreatmentMarker] = []
+
+    /// Settings › Apple Watch › Allow Start Without iPhone, as the phone last sent it; kept, so it holds while the
+    /// phone is away. Off until the phone says otherwise.
+    var allowUntetheredStartWithoutPhone: Bool = UserDefaults.standard
+        .bool(forKey: WatchMessageKeys.allowUntetheredStartWithoutPhoneWatch)
+    {
+        didSet {
+            UserDefaults.standard.set(allowUntetheredStartWithoutPhone, forKey: WatchMessageKeys.allowUntetheredStartWithoutPhoneWatch)
+        }
+    }
+
+    /// Settings › Apple Watch › Start by Itself When iPhone Stops, as the phone last sent it; kept for when it's gone.
+    var fallbackLoop: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.fallbackLoopWatch) {
+        didSet { UserDefaults.standard.set(fallbackLoop, forKey: WatchMessageKeys.fallbackLoopWatch) }
+    }
+
+    /// A workout session keeps Trio running through untethered mode (Extended Untethered Mode). Persisted, as a session
+    /// can start without the phone.
+    var untetheredWorkout: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.untetheredWorkoutWatch) {
+        didSet {
+            UserDefaults.standard.set(untetheredWorkout, forKey: WatchMessageKeys.untetheredWorkoutWatch)
+            if untetheredWorkout != oldValue { UntetheredWatchManager.shared.updateWorkoutKeepAlive() }
+        }
+    }
+
+    /// The minimal screen's slots (Extended Untethered Mode), as arranged on the phone. Persisted with the setting.
+    var glanceLayout: WatchGlanceLayout = UserDefaults.standard.stringArray(forKey: WatchMessageKeys.watchGlanceLayout)
+        .map(WatchGlanceLayout.init(strings:)) ?? .standard {
+        didSet { UserDefaults.standard.set(glanceLayout.strings, forKey: WatchMessageKeys.watchGlanceLayout) }
+    }
+
+    /// Off: the wrist shows the full app during Extended Untethered Mode, not the minimal screen.
+    var glanceEnabled: Bool = UserDefaults.standard.object(forKey: WatchMessageKeys.watchGlanceEnabled) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(glanceEnabled, forKey: WatchMessageKeys.watchGlanceEnabled) }
+    }
+
+    /// Settings › Notifications › Critical Alerts, as the phone last sent it; kept, so the watch's alarms follow it
+    /// while the phone is away. Turning it on asks watchOS for critical alerts, which only a build carrying the
+    /// critical-alerts entitlement is granted; without it the alarms stay ordinary notifications.
+    var useCriticalAlerts: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.useCriticalAlertsWatch) {
+        didSet {
+            UserDefaults.standard.set(useCriticalAlerts, forKey: WatchMessageKeys.useCriticalAlertsWatch)
+            if useCriticalAlerts {
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .criticalAlert]) { granted, _ in
+                    Task { await WatchLogger.shared.log("⌚️ Critical alerts on: watch notifications allowed=\(granted)", force: true) }
+                }
+            }
+        }
+    }
+
+    /// The phone app's version and build as it last said; kept. The watch app starts no session while it differs
+    /// from its own, which is the case for a while after an update, until watchOS has installed the new watch app.
+    var phoneAppVersion: String? = UserDefaults.standard.string(forKey: WatchMessageKeys.phoneAppVersion) {
+        didSet { UserDefaults.standard.set(phoneAppVersion, forKey: WatchMessageKeys.phoneAppVersion) }
+    }
+
+    // chart lines and markers
+    /// The phone's low and high glucose and current target, in mg/dL.
+    /// The current glucose is the watch's own reading (untethered mode), not the phone's.
+    var currentGlucoseIsWatchOwn = false
+
+    /// Kept, so the lines and the time-in-range bar stay while the phone is away and after a relaunch.
+    var chartLowMgDL: Double? = UserDefaults.standard.object(forKey: "chartLowMgDL") as? Double {
+        didSet { UserDefaults.standard.set(chartLowMgDL, forKey: "chartLowMgDL") }
+    }
+    var chartHighMgDL: Double? = UserDefaults.standard.object(forKey: "chartHighMgDL") as? Double {
+        didSet { UserDefaults.standard.set(chartHighMgDL, forKey: "chartHighMgDL") }
+    }
+    var chartTargetMgDL: Double? = UserDefaults.standard.object(forKey: "chartTargetMgDL") as? Double {
+        didSet { UserDefaults.standard.set(chartTargetMgDL, forKey: "chartTargetMgDL") }
+    }
+    /// Carbs and boluses of the last 24 hours from the phone, times only.
+    var phoneTreatmentMarkers: [WatchTreatmentMarker] = []
+    /// IOB and COB at each of the phone's loops in the last 24 hours, for the chart's scrub line.
+    var phoneIobCob: [WatchIobCobPoint] = []
+    /// The same from the watch's own loops while it runs untethered (kept in memory, a day at most).
+    var ownIobCob: [WatchIobCobPoint] = []
 
     // Acknowlegement handling
     var showCommsAnimation: Bool = false
@@ -156,13 +268,40 @@ import WatchConnectivity
                 self.forceConditionalWatchStateUpdate()
 
                 self.isReachable = session.isReachable
+                // a relaunch with the phone already in reach brings no reachability change: the history goes from here too
+                UntetheredWatchManager.shared.reachabilityChanged()
             }
         }
     }
 
+    /// The phone confirms parts of the plain watch log it has filed; the watch deletes them only then.
+    private static func handleLineLogAck(_ message: [String: Any]) -> Bool {
+        guard let ids = message[UntetheredLineLog.ackKey] as? [String] else { return false }
+        Task { await UntetheredLineLog.shared.acknowledge(ids) }
+        return true
+    }
+
+    /// Untethered mode's interactive messages; nothing else asks the watch for a reply.
+    func session(_: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        if message[UntetheredChunks.key] != nil {
+            UntetheredWatchManager.shared.receiveChunk(message, replyHandler: replyHandler)
+            return
+        }
+        guard message[UntetheredEnvelope.key] != nil else {
+            replyHandler([:])
+            return
+        }
+        UntetheredWatchManager.shared.receive(message, replyHandler: replyHandler)
+    }
+
     /// Handles incoming messages from the paired iPhone when Phone is in the foreground
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
+        if Self.handleLineLogAck(message) { return }
         if WatchLogger.shared.handlePhoneMessage(message) { return }
+        if message[UntetheredEnvelope.key] != nil {
+            UntetheredWatchManager.shared.receive(message, replyHandler: nil)
+            return
+        }
 
         // Ack at top level — no `watchState` wrapper, no staleness check.
         if let acknowledged = message[WatchMessageKeys.acknowledged] as? Bool,
@@ -195,7 +334,12 @@ import WatchConnectivity
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if Self.handleLineLogAck(userInfo) { return }
         if WatchLogger.shared.handlePhoneMessage(userInfo) { return }
+        if userInfo[UntetheredEnvelope.key] != nil {
+            UntetheredWatchManager.shared.receive(userInfo, replyHandler: nil)
+            return
+        }
         handleIncomingWatchStatePayload(userInfo)
     }
 
@@ -203,10 +347,24 @@ import WatchConnectivity
         WatchLogger.shared.transferFinished(fileTransfer, error: error)
     }
 
+    /// The phone's wake while the watch has the pump (EJM0 fba0698): nothing but a nudge to re-check the sensor and
+    /// send what is left. Any other context is a watch state.
+    func session(_: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
+        if applicationContext[WatchMessageKeys.untetheredWake] != nil {
+            let phoneReading = (applicationContext[WatchMessageKeys.phoneOwnGlucoseDate] as? TimeInterval)
+                .map { Date(timeIntervalSince1970: $0) }
+            DispatchQueue.main.async { UntetheredWatchManager.shared.phoneWake(phoneReadingAt: phoneReading) }
+            return
+        }
+        handleIncomingWatchStatePayload(applicationContext)
+    }
+
     /// Shared path for watch-state payloads from either delegate method.
     /// Enforces the freshness contract in one place so the two delivery paths
     /// can't drift.
     private func handleIncomingWatchStatePayload(_ dictionary: [String: Any]) {
+        // an untethered watch shows its own data; the phone's would be older
+        guard !UntetheredWatchManager.shared.isActive else { return }
         guard let payload = dictionary[WatchMessageKeys.watchState] as? [String: Any],
               let timestamp = payload[WatchMessageKeys.date] as? TimeInterval
         else {
@@ -245,6 +403,10 @@ import WatchConnectivity
     func session(_: WCSession, didFinish _: WCSessionUserInfoTransfer, error: (any Error)?) {
         if let error = error {
             WatchLogger.shared.warning(.connectivity, "User info transfer to the phone failed", error: error)
+            // untethered history among it would otherwise wait for the phone's next sync request
+            DispatchQueue.main.async { UntetheredWatchManager.shared.requeueUnconfirmed() }
+            // plain watch lines among it are sent again; the phone skips what it already has
+            Task { await UntetheredLineLog.shared.transferFailed() }
         }
     }
 
@@ -256,7 +418,10 @@ import WatchConnectivity
                 WatchLogger.shared.debug(.connectivity, "Phone reachable: \(session.isReachable)")
             }
 
-            if session.isReachable {
+            self.isReachable = session.isReachable
+            UntetheredWatchManager.shared.reachabilityChanged()
+
+            if session.isReachable, !UntetheredWatchManager.shared.isActive {
                 self.forceConditionalWatchStateUpdate()
 
                 // reset input amounts
@@ -278,6 +443,11 @@ import WatchConnectivity
     ///
     /// it will show a syncing animation and request a new watch state update from the iPhone app.
     private func forceConditionalWatchStateUpdate() {
+        // an untethered watch shows its own data, restored from disk on launch
+        if UntetheredWatchManager.shared.isActive {
+            UntetheredWatchManager.shared.publishToWatchState()
+            return
+        }
         guard let lastUpdateTimestamp = lastWatchStateUpdate else {
             WatchLogger.shared.debug(.data, "No watch state yet, requesting one")
 
@@ -484,6 +654,10 @@ import WatchConnectivity
             }
         }
 
+        if let secret = message[WatchMessageKeys.remoteControlSecret] as? String {
+            RemoteSecretStore.set(secret)
+        }
+
         if let maxFatValue = message[WatchMessageKeys.maxFat] {
             if let decimalValue = (maxFatValue as? NSNumber)?.decimalValue {
                 maxFat = decimalValue
@@ -528,6 +702,118 @@ import WatchConnectivity
             forecastConeMin = forecastPayload[WatchMessageKeys.forecastConeMin] as? [Double] ?? []
             forecastConeMax = forecastPayload[WatchMessageKeys.forecastConeMax] as? [Double] ?? []
             forecastLines = forecastPayload[WatchMessageKeys.forecastLines] as? [String: [Double]] ?? [:]
+        }
+
+        // each payload carries the whole set: a field it leaves out is gone (a removed pod, a sensor without expiry)
+        if let devices = message[WatchMessageKeys.peripheralData] as? [String: Any] {
+            func date(_ key: String) -> Date? { (devices[key] as? TimeInterval).map { Date(timeIntervalSince1970: $0) } }
+            pumpName = devices[WatchMessageKeys.pumpName] as? String
+            pumpReservoir = (devices[WatchMessageKeys.pumpReservoir] as? NSNumber)?.decimalValue
+            pumpBatteryPercent = (devices[WatchMessageKeys.pumpBatteryPercent] as? NSNumber)?.intValue
+            pumpExpiresAt = date(WatchMessageKeys.pumpExpiresAt)
+            pumpActivatedAt = date(WatchMessageKeys.pumpActivatedAt)
+            pumpStatusMessage = devices[WatchMessageKeys.pumpStatusMessage] as? String
+            cgmName = devices[WatchMessageKeys.cgmName] as? String
+            cgmSensorExpiresAt = date(WatchMessageKeys.cgmSensorExpiresAt)
+            cgmProgressPercent = (devices[WatchMessageKeys.cgmProgressPercent] as? NSNumber)?.doubleValue
+            cgmProgressState = devices[WatchMessageKeys.cgmProgressState] as? String
+            cgmStatusMessage = devices[WatchMessageKeys.cgmStatusMessage] as? String
+            hasReceivedPeripheralData = true
+        }
+
+        if let mode = message[WatchMessageKeys.untetheredModeWatch] as? Bool, mode != untetheredMode {
+            untetheredMode = mode
+        }
+
+        if let version = message[WatchMessageKeys.phoneAppVersion] as? String, version != phoneAppVersion {
+            phoneAppVersion = version
+        }
+
+        if let critical = message[WatchMessageKeys.useCriticalAlertsWatch] as? Bool, critical != useCriticalAlerts {
+            useCriticalAlerts = critical
+        }
+
+        if let fallback = message[WatchMessageKeys.fallbackLoopWatch] as? Bool, fallback != fallbackLoop {
+            fallbackLoop = fallback
+        }
+
+        // the phone's Upload to Nightscout From the Watch: the address and secret hash, or empty to forget them
+        if let nightscout = message[WatchMessageKeys.nightscoutWatch] as? [String: Any] {
+            let credentials = UntetheredNightscoutCredentials(dictionary: nightscout)
+            Task { await WatchNightscoutUploader.shared.setCredentials(credentials) }
+        }
+
+        if let workout = message[WatchMessageKeys.untetheredWorkoutWatch] as? Bool, workout != untetheredWorkout {
+            untetheredWorkout = workout
+        }
+
+        if let enabled = message[WatchMessageKeys.watchGlanceEnabled] as? Bool, enabled != glanceEnabled {
+            glanceEnabled = enabled
+        }
+
+        if let strings = message[WatchMessageKeys.watchGlanceLayout] as? [String] {
+            let layout = WatchGlanceLayout(strings: strings)
+            if layout != glanceLayout { glanceLayout = layout }
+        }
+
+        if let allow = message[WatchMessageKeys.allowUntetheredStartWithoutPhoneWatch] as? Bool {
+            if allow != allowUntetheredStartWithoutPhone { allowUntetheredStartWithoutPhone = allow }
+            // also a copy an earlier build left, when it was sent regardless
+            if !allow || !untetheredMode { DispatchQueue.main.async { UntetheredWatchManager.shared.dropStandingGrant() } }
+        }
+
+        // Start by Itself waits for readings of the watch's own reader, so the reader comes on with it, once each time
+        // the setting comes on (27 October: the reader was off since a reset, and the watch never started by itself).
+        // Switched off by hand afterwards, it stays off; its page then says what that stops.
+        let fallbackWantsReader = fallbackLoop && untetheredMode && allowUntetheredStartWithoutPhone
+        let readerEnsuredKey = "fallbackLoop.readerEnsured"
+        if fallbackWantsReader, !UserDefaults.standard.bool(forKey: readerEnsuredKey) {
+            UserDefaults.standard.set(true, forKey: readerEnsuredKey)
+            DispatchQueue.main.async {
+                if !WatchG7Reader.shared.isEnabled {
+                    WatchG7Reader.shared.setEnabled(true)
+                    Task { await WatchLogger.shared.log("⌚️ Untethered: watch sensor turned on for Start by Itself", force: true) }
+                }
+            }
+        } else if !fallbackWantsReader {
+            UserDefaults.standard.set(false, forKey: readerEnsuredKey)
+        }
+
+        if let low = message["complicationRangeLowMgDL"] as? Double, low != chartLowMgDL { chartLowMgDL = low }
+        if let high = message["complicationRangeHighMgDL"] as? Double, high != chartHighMgDL { chartHighMgDL = high }
+        if let target = message["complicationTargetMgDL"] as? Double, target != chartTargetMgDL { chartTargetMgDL = target }
+        if let carbs = message[WatchMessageKeys.chartCarbs] as? [TimeInterval],
+           let boluses = message[WatchMessageKeys.chartBoluses] as? [[String: Any]]
+        {
+            phoneTreatmentMarkers = boluses.compactMap { entry -> WatchTreatmentMarker? in
+                guard let time = entry["date"] as? TimeInterval else { return nil }
+                let smb = entry["smb"] as? Bool ?? false
+                return WatchTreatmentMarker(id: "bolus-\(time)", date: Date(timeIntervalSince1970: time), kind: smb ? .smb : .bolus)
+            } + carbs.map { time in
+                WatchTreatmentMarker(id: "carbs-\(time)", date: Date(timeIntervalSince1970: time), kind: .carbs)
+            }
+        }
+
+        if let points = message[WatchMessageKeys.chartIobCob] as? [[String: Double]] {
+            phoneIobCob = points.compactMap { point in
+                guard let time = point["date"] else { return nil }
+                return WatchIobCobPoint(date: Date(timeIntervalSince1970: time), iob: point["iob"] ?? 0, cob: point["cob"] ?? 0)
+            }
+        }
+
+        // Sensor details, alarm thresholds and units for the watch's own G7 reading.
+        WatchG7Reader.shared.updateFromPhone(message)
+        // a session the fallback started goes back once the phone sends fresh readings again
+        UntetheredWatchManager.shared.notePhoneState()
+        // after the reader took the units and alert thresholds from the same message
+        if message[WatchMessageKeys.glucoseValues] != nil {
+            ComplicationStore.update(
+                from: self,
+                lowMgDL: message["complicationRangeLowMgDL"] as? Double,
+                highMgDL: message["complicationRangeHighMgDL"] as? Double,
+                colorScheme: message["complicationColorScheme"] as? String,
+                targetMgDL: message["complicationTargetMgDL"] as? Double
+            )
         }
     }
 }

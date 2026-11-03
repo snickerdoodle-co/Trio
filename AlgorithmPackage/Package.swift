@@ -61,9 +61,21 @@ let package = Package(
         .target(
             name: "Trio",
             path: "Sources",
+            exclude: ["Localizations"],
+            // OrefPipeline and the files after it are also compiled into the untethered watch
             sources: [
                 "APS/OpenAPSSwift",
-                "APS/Extensions/DecimalExtensions.swift"
+                "APS/Extensions/DecimalExtensions.swift",
+                "APS/OpenAPS/OrefPipeline.swift",
+                "Helpers/TempTargetCalculations.swift",
+                "Models/DosingMode.swift",
+                "Models/Preferences+DosingMode.swift",
+                "Models/Untethered",
+                "Models/WatchMessageKeys.swift",
+                "Services/BolusCalculator/BolusCalculator.swift",
+                "APS/GlucoseSmoothing.swift",
+                "APS/Storage/TDDCalculator.swift",
+                "APS/Storage/ScheduledBasalInference.swift"
             ] + algorithmModels + algorithmHelpers,
             swiftSettings: [.define("TRIO_ALGORITHM_PACKAGE")]
         ),
