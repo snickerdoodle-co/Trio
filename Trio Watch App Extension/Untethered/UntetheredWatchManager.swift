@@ -247,6 +247,7 @@ import WatchKit
     private func handle(_ envelope: UntetheredEnvelope, replyHandler: (([String: Any]) -> Void)?) {
         lastPhoneContact = Date()
         notePhoneHeardForWarning()
+        pauseLooksIfPhoneAtPod(envelope.message)
         if let version = envelope.appVersion, WatchState.shared.phoneAppVersion != version {
             WatchState.shared.phoneAppVersion = version
         }
@@ -501,6 +502,10 @@ import WatchKit
                 if let replyHandler = reply {
                     self.reply(message, epoch: epoch, via: replyHandler)
                     reply = nil
+                } else if case .statusReport = message {
+                    // the answer to the phone's ownership question: the phone doesn't dose until it has it, so it is
+                    // queued too when the phone can't be reached this moment (the phone ignores it once it decided)
+                    send(message, epoch: epoch, queueing: true)
                 } else {
                     send(message, epoch: epoch)
                 }
@@ -683,6 +688,10 @@ import WatchKit
             Task { await WatchLogger.shared.log("⌚️ Untethered: the takeover goes on with the look's pod manager", force: true) }
         } else {
             if let witness, !witness.pump.isControlReleased { witness.pump.releaseControl() }
+            // A look's manager is kept between two looks; a start by hand meanwhile made its own beside it, which never
+            // reached the pod (3 November, 11:49 and 11:52: a minute after the 11:48 look, both starts timed out and
+            // the phone took the pump back).
+            dropFallbackWitness()
             guard let grant = data.grant,
                   let configuration = Self.configuration(data.handover?.pumpConfiguration ?? grant.pumpConfiguration),
                   let type = watchPumpManagers[configuration.managerIdentifier],
@@ -873,7 +882,8 @@ import WatchKit
                         force: true
                     )
                 }
-                self.scheduleFallbackHandback()
+                // at once: woken in the background, the app is frozen again long before a minute's grace is up
+                self.scheduleFallbackHandback(grace: 0)
             }
         }
     }
@@ -1978,6 +1988,25 @@ extension UntetheredWatchManager {
         }
     }
 
+    /// The phone's ownership question and its take-back come from a phone that has just been at the pod: no look for a
+    /// while. A look is a session on the pod the phone has to refuse and ask about, with its dosing held meanwhile; one
+    /// 9 s after the phone took the pump back left it refusing for 10 minutes, a bolus with it (3 November, second
+    /// tester, 14:28:52). Its phone readings reach a sleeping watch late, so they alone don't stop the looks.
+    private func pauseLooksIfPhoneAtPod(_ message: UntetheredMessage) {
+        switch message {
+        case .revoke,
+             .statusQuery:
+            break
+        default:
+            return
+        }
+        guard data.session.phase == .idle || message == .revoke else { return }
+        dropFallbackWitness()
+        let phoneNewest = WatchG7Reader.shared.phoneGlucoseDate ?? .distantPast
+        fallbackLooksPaused = (phoneNewest, Date().addingTimeInterval(Self.fallbackLookPause))
+        Task { await WatchLogger.shared.log("⌚️ Untethered: fallback — the phone was just at the pod, no look for 9 min", force: true) }
+    }
+
     func dropFallbackWitness() {
         guard let witness = fallbackWitness else { return }
         if !witness.pump.isControlReleased { witness.pump.releaseControl() }
@@ -2099,10 +2128,10 @@ extension UntetheredWatchManager {
     /// session goes back to it, by the queued request a stall uses, as the watch is rarely in reach in the background
     /// (2026-10-21: the walk's request reached the phone on its own). The status goes first, so the phone knows the
     /// session the request names.
-    func scheduleFallbackHandback() {
+    func scheduleFallbackHandback(grace: TimeInterval = UntetheredWatchManager.fallbackHandbackGrace) {
         guard isFallbackSession, data.session.phase == .active, !fallbackHandbackPending else { return }
         fallbackHandbackPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.fallbackHandbackGrace) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
             guard let self else { return }
             self.fallbackHandbackPending = false
             // The fallback's own request goes again every 5 minutes while the phone shows up, not every 30 as a

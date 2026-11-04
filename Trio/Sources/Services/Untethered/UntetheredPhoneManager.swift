@@ -148,6 +148,22 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in Task { @MainActor in await self?.checkForeignSession() } }
             .store(in: &subscriptions)
+        // A refusal outside a loop raises neither: opening Trio fetches the pod's status, and a loop that changes
+        // nothing sends no command. On 3 November (second tester) the status fetches at 14:35 and 14:37 were refused
+        // after a look of the watch's, nobody asked the watch, and the bolus at 14:38 was refused too. Checked a few
+        // seconds after Trio comes to the front, when that fetch is done, and at every reading.
+        Foundation.NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                    Task { @MainActor in await self?.checkForeignSession() }
+                }
+            }
+            .store(in: &subscriptions)
+        glucoseStorage.updatePublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in Task { @MainActor in await self?.checkForeignSession() } }
+            .store(in: &subscriptions)
         broadcaster.register(SettingsObserver.self, observer: self)
         broadcaster.register(PreferencesObserver.self, observer: self)
         broadcaster.register(PumpSettingsObserver.self, observer: self)
@@ -166,6 +182,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     }
 
     var isWatchInCharge: Bool { !state.session.isIdle }
+    /// For what the screens show: not while the phone only asks the watch about the pod after another controller
+    /// used it (`isCheckingForeignSession`); dosing is held then all the same.
+    var isWatchShownInCharge: Bool { isWatchInCharge && !state.session.isCheckingForeignSession }
 
     /// After the phone's own reading, clear of the watch's: the two read the same sensor, and the watch's link to it
     /// comes up around the reading and stays some 40 s.
@@ -181,32 +200,55 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     /// While the watch has the pump, a small application context after each phone reading wakes the watch app, so it
     /// re-checks its sensor and sends its history even if a Bluetooth callback was lost.
     private func scheduleWatchWake() {
-        guard isWatchInCharge, Date().timeIntervalSince(lastWatchWake ?? .distantPast) >= Self.watchWakeInterval else { return }
+        guard isWatchInCharge else { return }
+        if tellWatchPhoneIsBack() { return }
+        guard Date().timeIntervalSince(lastWatchWake ?? .distantPast) >= Self.watchWakeInterval else { return }
         lastWatchWake = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.watchWakeDelay) { [weak self] in
             guard let self, self.isWatchInCharge else { return }
-            // A session the watch started without the phone goes back by itself once the phone reads the sensor
-            // again, but the watch only learns that from the phone: while it has the pump the phone sends no watch
-            // state, and a watch app in the background never sees the phone come in reach (2 November, 18:15 to
-            // 18:28: the phone was back and read the sensor, the watch kept the pump until the take-back by hand).
-            let ownReading = PhoneOwnGlucose.newest.flatMap { Date().timeIntervalSince($0) < Self.watchReadsFineWithin ? $0 : nil }
-            let phoneBack = self.state.session.startedWithoutPhone ? ownReading : nil
-            // a wake of the app's own is a draw on its background budget: only for a watch whose readings stopped,
-            // or to tell it the phone is back
-            if phoneBack == nil, let watchReading = self.lastWatchReadingAt,
-               Date().timeIntervalSince(watchReading) < Self.watchReadsFineWithin
-            {
+            // a wake of the app's own is a draw on its background budget: only for a watch whose readings stopped
+            if let watchReading = self.lastWatchReadingAt, Date().timeIntervalSince(watchReading) < Self.watchReadsFineWithin {
                 return
             }
             let session = WCSession.default
             guard WCSession.isSupported(), session.activationState == .activated, session.isWatchAppInstalled else { return }
-            var context: [String: Any] = [WatchMessageKeys.untetheredWake: Date().timeIntervalSince1970]
-            if let phoneBack {
-                context[WatchMessageKeys.phoneOwnGlucoseDate] = phoneBack.timeIntervalSince1970
-                debug(.watch, "Untethered: the phone reads the sensor again, telling the watch at its next wake")
-            }
-            try? session.updateApplicationContext(context)
+            try? session.updateApplicationContext([WatchMessageKeys.untetheredWake: Date().timeIntervalSince1970])
         }
+    }
+
+    /// The phone's own reading the watch was last told about.
+    private var phoneBackToldFor: Date?
+
+    /// A session the watch started without the phone goes back by itself once the phone reads the sensor again, but the
+    /// watch only learns that from the phone: while it has the pump the phone sends no watch state, and a watch app in
+    /// the background never sees the phone come in reach (2 November, 18:15 to 18:28). Told at once after each of the
+    /// phone's own readings, not after the wake's delay: in the background the phone is suspended seconds after its
+    /// reading, so the delayed word went out only when Trio was next opened on the phone, and as an application
+    /// context it waited on the watch until Trio ran there (3 November, back and reading from 11:19, the watch heard
+    /// at 11:34). A complication transfer wakes the watch app in the background.
+    private func tellWatchPhoneIsBack() -> Bool {
+        guard state.session.startedWithoutPhone, let own = PhoneOwnGlucose.newest,
+              Date().timeIntervalSince(own) < Self.watchReadsFineWithin
+        else { return false }
+        guard own > (phoneBackToldFor ?? .distantPast) else { return true }
+        let session = WCSession.default
+        guard WCSession.isSupported(), session.activationState == .activated, session.isWatchAppInstalled else { return true }
+        phoneBackToldFor = own
+        let context: [String: Any] = [
+            WatchMessageKeys.untetheredWake: Date().timeIntervalSince1970,
+            WatchMessageKeys.phoneOwnGlucoseDate: own.timeIntervalSince1970
+        ]
+        try? session.updateApplicationContext(context)
+        if session.isComplicationEnabled, session.remainingComplicationUserInfoTransfers > 0 {
+            session.transferCurrentComplicationUserInfo(context)
+            debug(
+                .watch,
+                "Untethered: the phone reads the sensor again, told the watch now (complication transfer, \(session.remainingComplicationUserInfoTransfers) left today)"
+            )
+        } else {
+            debug(.watch, "Untethered: the phone reads the sensor again, telling the watch at its next wake (no complication on the watch face)")
+        }
+        return true
     }
 
     // MARK: - Standing grant
@@ -715,6 +757,17 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
              .statusQuery:
             // queued as well: the watch must hear it whenever it comes back
             session.transferUserInfo(payload)
+            // The ownership question after a foreign pod session: the phone doesn't dose until it has the answer, and
+            // a queued message waits for the watch's next wake (2 November, 19:49 to 19:53: the watch had only looked
+            // at the pod, and the phone's SMB waited 4.5 minutes). With Trio on the watch face, a complication
+            // transfer wakes the watch app at once; rare, so well within its daily budget.
+            if case .statusQuery = message, session.isComplicationEnabled, session.remainingComplicationUserInfoTransfers > 0 {
+                session.transferCurrentComplicationUserInfo(payload)
+                debug(
+                    .watch,
+                    "Untethered: ownership question also sent as a complication transfer (\(session.remainingComplicationUserInfoTransfers) left today)"
+                )
+            }
         case .recordsStored:
             session.transferUserInfo(payload)
             return
@@ -974,7 +1027,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             tddHours: UntetheredTDDHour.hours(tddRows),
             tddPumpHistory: try await pumpHistoryStorage.getPumpHistory(),
             autosens: storage.retrieve(OpenAPS.Settings.autosense, as: Autosens.self),
-            reservoir: storage.retrieve(OpenAPS.Monitor.reservoir, as: Decimal.self),
+            reservoir: apsManager.pumpManager?.currentReservoir,
             maxBolus: settingsManager.pumpSettings.maxBolus,
             maxCarbs: settings.maxCarbs,
             bolusCalculator: UntetheredBolusCalculatorSettings(

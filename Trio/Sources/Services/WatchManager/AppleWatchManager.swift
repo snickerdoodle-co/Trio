@@ -627,10 +627,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
         if let message = apsManager.pumpManager?.pumpStatusHighlight?.localizedMessage {
             details[WatchMessageKeys.pumpStatusMessage] = message
         }
-        // the home header's file; Omnipod's "50+ U" marker (0xDEAD_BEEF) passes through and the watch shows it so
-        if apsManager.pumpManager != nil,
-           let reservoir = fileStorage.retrieve(OpenAPS.Monitor.reservoir, as: Decimal.self)
-        {
+        // as the home header; Omnipod's "50+ U" marker (0xDEAD_BEEF) passes through and the watch shows it so
+        if let reservoir = apsManager.pumpManager?.currentReservoir {
             details[WatchMessageKeys.pumpReservoir] = reservoir
         }
 

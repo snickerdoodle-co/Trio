@@ -281,7 +281,6 @@ final class OpenAPS {
         async let profileAsync = loadFileFromStorageAsync(name: Settings.profile)
         async let basalAsync = loadFileFromStorageAsync(name: Settings.basalProfile)
         async let autosenseAsync = loadFileFromStorageAsync(name: Settings.autosense)
-        async let reservoirAsync = loadFileFromStorageAsync(name: Monitor.reservoir)
         async let hasSufficientTddForDynamic = tddStorage.hasSufficientTDD()
 
         // Await the results of asynchronous tasks
@@ -293,7 +292,6 @@ final class OpenAPS {
             rawProfile,
             rawBasalProfile,
             rawAutosens,
-            rawReservoir,
             hasSufficientTdd
         ) = await (
             try parsePumpHistory(on: context, await pumpHistoryObjectIDs, simulatedBolusAmount: simulatedBolusAmount),
@@ -303,7 +301,6 @@ final class OpenAPS {
             profileAsync,
             basalAsync,
             autosenseAsync,
-            reservoirAsync,
             try hasSufficientTddForDynamic
         )
 
@@ -314,7 +311,6 @@ final class OpenAPS {
         OrefPipeline.prepareForDosing(&profile, supportedBasalRates: supportedBasalRates, dosingMode: dosingMode)
         let basalProfile = try JSONBridge.basalProfile(from: rawBasalProfile)
         let autosens = try JSONBridge.autosens(from: rawAutosens.isEmpty ? .null : rawAutosens)
-        let reservoir = Decimal(string: rawReservoir) ?? 100
         let trioCustomOrefVariables = try JSONBridge.trioCustomOrefVariables(from: rawTrioCustomOrefVariables)
 
         // Meal calculation
@@ -355,7 +351,6 @@ final class OpenAPS {
             autosens: autosens,
             meal: meal,
             microBolusAllowed: true,
-            reservoir: reservoir,
             preferences: preferences,
             trioCustomOrefVariables: trioCustomOrefVariables,
             clock: Date()

@@ -268,7 +268,6 @@ extension UntetheredWatchManager {
             hasSufficientTDD: UntetheredAlgorithm.hasSufficientTDD(hours: data.tddHours, now: now) ?? grant.hasSufficientTDD,
             currentTemp: currentTemp,
             supportedBasalRates: pump.supportedBasalRates.map { Decimal($0) },
-            reservoir: data.reservoir ?? 100,
             now: now
         )
     }

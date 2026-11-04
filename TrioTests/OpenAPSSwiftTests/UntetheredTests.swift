@@ -859,7 +859,6 @@ import Testing
             hasSufficientTDD: true,
             currentTemp: TempBasal(duration: 0, rate: 0, temp: .absolute, timestamp: now),
             supportedBasalRates: (0 ... 60).map { Decimal($0) * 0.05 },
-            reservoir: 100,
             now: now
         )
         let (determination, used) = try #require(try UntetheredAlgorithm.determine(inputs))

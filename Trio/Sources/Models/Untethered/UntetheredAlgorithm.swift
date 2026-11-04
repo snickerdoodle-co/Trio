@@ -18,7 +18,6 @@ enum UntetheredAlgorithm {
         let hasSufficientTDD: Bool
         let currentTemp: TempBasal
         let supportedBasalRates: [Decimal]
-        let reservoir: Decimal
         let now: Date
     }
 
@@ -86,7 +85,6 @@ enum UntetheredAlgorithm {
             autosens: autosens,
             meal: meal,
             microBolusAllowed: true,
-            reservoir: inputs.reservoir,
             preferences: preferences,
             trioCustomOrefVariables: OrefPipeline.customOrefVariables(
                 override: inputs.override,

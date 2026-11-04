@@ -340,6 +340,8 @@ import WatchConnectivity
             UntetheredWatchManager.shared.receive(userInfo, replyHandler: nil)
             return
         }
+        // the phone's wake also comes as a complication transfer, which wakes the app in the background
+        if handleUntetheredWake(userInfo) { return }
         handleIncomingWatchStatePayload(userInfo)
     }
 
@@ -350,13 +352,16 @@ import WatchConnectivity
     /// The phone's wake while the watch has the pump (EJM0 fba0698): nothing but a nudge to re-check the sensor and
     /// send what is left. Any other context is a watch state.
     func session(_: WCSession, didReceiveApplicationContext applicationContext: [String: Any]) {
-        if applicationContext[WatchMessageKeys.untetheredWake] != nil {
-            let phoneReading = (applicationContext[WatchMessageKeys.phoneOwnGlucoseDate] as? TimeInterval)
-                .map { Date(timeIntervalSince1970: $0) }
-            DispatchQueue.main.async { UntetheredWatchManager.shared.phoneWake(phoneReadingAt: phoneReading) }
-            return
-        }
+        if handleUntetheredWake(applicationContext) { return }
         handleIncomingWatchStatePayload(applicationContext)
+    }
+
+    private func handleUntetheredWake(_ dictionary: [String: Any]) -> Bool {
+        guard dictionary[WatchMessageKeys.untetheredWake] != nil else { return false }
+        let phoneReading = (dictionary[WatchMessageKeys.phoneOwnGlucoseDate] as? TimeInterval)
+            .map { Date(timeIntervalSince1970: $0) }
+        DispatchQueue.main.async { UntetheredWatchManager.shared.phoneWake(phoneReadingAt: phoneReading) }
+        return true
     }
 
     /// Shared path for watch-state payloads from either delegate method.

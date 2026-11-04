@@ -199,7 +199,6 @@ enum OrefPipeline {
         autosens: Autosens?,
         meal: ComputedCarbs?,
         microBolusAllowed: Bool,
-        reservoir: Decimal,
         preferences: Preferences,
         trioCustomOrefVariables: TrioCustomOrefVariables,
         clock: Date
@@ -215,7 +214,6 @@ enum OrefPipeline {
             iobData: iob,
             mealData: meal,
             autosensData: autosens,
-            reservoirData: reservoir,
             glucose: glucose,
             microBolusAllowed: microBolusAllowed,
             trioCustomOrefVariables: trioCustomOrefVariables,

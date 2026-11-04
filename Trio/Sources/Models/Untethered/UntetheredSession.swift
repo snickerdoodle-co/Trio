@@ -96,6 +96,13 @@ struct UntetheredSession: Codable, Equatable {
 
     var isIdle: Bool { phase == .idle }
 
+    /// Phone: set when a refused pod command, not a start, made it ask the watch. Optional so older saved states load.
+    private(set) var checkingForeignSession: Bool?
+    /// The phone is only asking whether the watch has the pump after another controller used the pod. It shows as
+    /// that, not as untethered: on 3 November the second tester's phone said "Untethered on Apple Watch" for 5 minutes
+    /// while the watch had nothing, and again after a refused bolus.
+    var isCheckingForeignSession: Bool { phase == .starting && checkingForeignSession == true }
+
     // MARK: - Phone
 
     mutating func phone(_ event: PhoneEvent, now: Date) -> [Effect] {
@@ -139,6 +146,7 @@ struct UntetheredSession: Codable, Equatable {
             phase = .starting
             leaseExpiresAt = now
             statusQueried = true
+            checkingForeignSession = true
             startStatus = status
             return [.send(.statusQuery)]
 

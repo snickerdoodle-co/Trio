@@ -90,11 +90,15 @@ struct UntetheredStatusView: View {
         ) {
             Button("Emergency Stop", role: .destructive) { manager.emergencyStop() }
         }
-        .confirmationDialog(
-            "Deactivate the pod? It stops delivering insulin and its alarm ends. Remove it, then pair a new pod on the phone.",
-            isPresented: $confirmDeactivate
-        ) {
-            Button("Deactivate Pod", role: .destructive) {
+        // not a tap: a full turn of the crown, which a brush against the small screen doesn't make
+        .sheet(isPresented: $confirmDeactivate) {
+            CrownConfirmView(
+                title: String(localized: "Deactivate Pod"),
+                message: String(
+                    localized: "The pod stops delivering insulin and its alarm ends. Remove it, then pair a new pod on the phone."
+                ),
+                prompt: String(localized: "Turn the crown to deactivate")
+            ) {
                 isDeactivating = true
                 deactivateError = nil
                 manager.deactivatePod { error in
@@ -1138,5 +1142,66 @@ struct ManualGlucoseEntryView: View {
         manager.addManualGlucose(mgdl: mgdl)
         WKInterfaceDevice.current().play(.success)
         dismiss()
+    }
+}
+
+/// A risky action confirmed by a full turn of the Digital Crown instead of a tap: a deliberate motion that a
+/// brush against the small screen doesn't make. Turning back, Cancel or closing the sheet confirms nothing.
+struct CrownConfirmView: View {
+    let title: String
+    let message: String
+    let prompt: String
+    let onConfirm: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var turn = 0.0
+    @State private var confirmed = false
+    @FocusState private var crownFocused: Bool
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 8) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                Text(message)
+                    .font(.footnote)
+                    .multilineTextAlignment(.center)
+                ZStack {
+                    Circle()
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 6)
+                    Circle()
+                        .trim(from: 0, to: turn)
+                        .stroke(Color.red, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Image(systemName: "arrow.clockwise")
+                        .font(.title3)
+                }
+                .frame(width: 64, height: 64)
+                .focusable(true)
+                .focused($crownFocused)
+                .digitalCrownRotation(
+                    $turn,
+                    from: 0,
+                    through: 1,
+                    by: 0.01,
+                    sensitivity: .low,
+                    isContinuous: false,
+                    isHapticFeedbackEnabled: true
+                )
+                Text(prompt)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Button("Cancel") { dismiss() }
+            }
+        }
+        .onAppear { crownFocused = true }
+        .onChange(of: turn) { _, value in
+            guard value >= 1, !confirmed else { return }
+            confirmed = true
+            WKInterfaceDevice.current().play(.success)
+            dismiss()
+            onConfirm()
+        }
     }
 }

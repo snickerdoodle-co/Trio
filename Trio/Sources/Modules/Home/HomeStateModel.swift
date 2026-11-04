@@ -1083,7 +1083,7 @@ extension Home.StateModel:
         }
     }
 
-    func pumpReservoirDidChange(_: Decimal) {
+    func pumpReservoirDidChange(_: Decimal?) {
         setupReservoir()
         displayPumpStatusHighlightMessage()
         displayPumpStatusBadge()

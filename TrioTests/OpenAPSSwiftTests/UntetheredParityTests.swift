@@ -71,7 +71,6 @@ import Testing
             autosens: autosens,
             meal: meal,
             microBolusAllowed: true,
-            reservoir: scenario.reservoir,
             preferences: preferences,
             trioCustomOrefVariables: OrefPipeline.customOrefVariables(
                 override: override,
@@ -113,7 +112,7 @@ import Testing
             tddHours: [],
             tddPumpHistory: [],
             autosens: nil,
-            reservoir: scenario.reservoir,
+            reservoir: 150,
             maxBolus: 10,
             maxCarbs: 100,
             bolusCalculator: UntetheredBolusCalculatorSettings(
@@ -151,7 +150,6 @@ import Testing
             hasSufficientTDD: hasSufficientTDD,
             currentTemp: scenario.currentTemp,
             supportedBasalRates: ParityInputs.supportedBasalRates(),
-            reservoir: scenario.reservoir,
             now: scenario.clock
         )
     }
@@ -211,7 +209,7 @@ import Testing
             grant: base.grant, pumpHistory: base.pumpHistory, glucose: base.glucose, carbs: base.carbs,
             tempTargets: base.tempTargets, activeTempTarget: base.activeTempTarget, override: nil, autosens: stored,
             tdd: tdd, hasSufficientTDD: sufficient, currentTemp: base.currentTemp,
-            supportedBasalRates: base.supportedBasalRates, reservoir: base.reservoir, now: scenario.clock
+            supportedBasalRates: base.supportedBasalRates, now: scenario.clock
         )
         #expect(OrefPipeline.autosensIsCurrent(stored, now: scenario.clock))
         let (_, used) = try #require(try UntetheredAlgorithm.determine(inputs))
