@@ -19,6 +19,7 @@ struct UntetheredStatusView: View {
     @State private var confirmStop = false
     @State private var confirmDeactivate = false
     @State private var confirmDiscard = false
+    @State private var confirmPairAgain = false
     @State private var isDeactivating = false
     @State private var deactivateError: String?
 
@@ -47,6 +48,14 @@ struct UntetheredStatusView: View {
                                 .font(.footnote)
                         }
                     }
+                    if manager.offersSensorPairAgain {
+                        // here, not only on the sensor page: where the warning is, and Trio has to stay in front
+                        // for the pairing request
+                        Button(role: .destructive) { confirmPairAgain = true } label: {
+                            Label("Pair Again", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.footnote)
+                        }
+                    }
                     if manager.isActive { tiles }
                     if manager.isActive {
                         // remote commands come through the phone's push: without it online they wait or run out
@@ -69,6 +78,9 @@ struct UntetheredStatusView: View {
         }
         .sheet(isPresented: $showLog) {
             WatchG7DetailsView()
+        }
+        .confirmationDialog("Pair the watch with the sensor again?", isPresented: $confirmPairAgain) {
+            Button("Pair Again", role: .destructive) { manager.pairSensorAgain() }
         }
         .confirmationDialog("Hand the pump back to the phone?", isPresented: $confirmEnd) {
             Button("Hand Back") { manager.end() }
@@ -322,6 +334,14 @@ struct UntetheredStatusView: View {
             HStack(spacing: 8) {
                 ProgressView().frame(width: 20)
                 Text(phase == .ending ? "Handing back…" : "Starting…").font(.footnote)
+            }
+            .padding(.top, 4)
+        } else if phase == .idle, manager.isMeetingPod {
+            // no Start while the watch looks for a new pod: a start then made a second manager search beside it, which
+            // didn't find the pod in 2 minutes (3 November, 18:04:55; the watch's own search found it in 9 s at 18:11)
+            HStack(spacing: 8) {
+                ProgressView().frame(width: 20)
+                Text("Looking for the new pod…").font(.footnote)
             }
             .padding(.top, 4)
         } else {

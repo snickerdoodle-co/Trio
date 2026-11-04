@@ -60,34 +60,6 @@ func watchCGMAppBecameActive(_ manager: CGMManager?) {
     (manager as? G7CGMManager)?.appBecameActive()
 }
 
-/// While the G7's link is up, and 3 s after it closed, a pod command's connect waits (at most 15 s, in OmnipodKit):
-/// the two share the watch's one radio, and a pod command cut off then began every pod stall. Before (Trio 53ddccc)
-/// only the loop waited; on 23 October 12 of 48 pod connects still came at the sensor's link-up, and one of them
-/// started the stall at 12:40:56.
-func watchGatePodCommands(on manager: CGMManager?) {
-    guard let g7 = manager as? G7CGMManager else {
-        OmniPumpManager.commandConnectDelay = nil
-        return
-    }
-    let lastSeen = SensorLinkClock()
-    OmniPumpManager.commandConnectDelay = { [weak g7] in
-        guard let g7 else { return 0 }
-        if g7.isConnected {
-            lastSeen.mark()
-            return 1
-        }
-        return max(0, 3 - lastSeen.secondsSince)
-    }
-}
-
-/// When the sensor's link was last seen up; read and written from OmnipodKit's queue.
-private final class SensorLinkClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var date = Date.distantPast
-    func mark() { lock.lock(); date = Date(); lock.unlock() }
-    var secondsSince: TimeInterval { lock.lock(); defer { lock.unlock() }; return Date().timeIntervalSince(date) }
-}
-
 /// The sensor's link is up right now: a reading or its backfill is on the radio.
 func watchCGMIsConnected(_ manager: CGMManager?) -> Bool {
     (manager as? G7CGMManager)?.isConnected ?? false

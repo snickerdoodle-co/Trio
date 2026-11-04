@@ -27,10 +27,7 @@ import WatchKit
     @ObservationIgnored var podQuietUntil: Date?
 
     @ObservationIgnored var pumpManager: (PumpManager & ExclusiveDeviceControl)?
-    @ObservationIgnored var cgmManager: CGMManager? {
-        // every pod command waits for the sensor's link, not only the loop's (OmniPumpManager.commandConnectDelay)
-        didSet { watchGatePodCommands(on: cgmManager) }
-    }
+    @ObservationIgnored var cgmManager: CGMManager?
     @ObservationIgnored var isLooping = false
     /// The phone's standing grant as a fallback try started from it: a start seeds from it and drops it, and a try that
     /// never reached the pod dosed nothing, so the next try starts from it again.
@@ -185,6 +182,28 @@ import WatchKit
         } else {
             DispatchQueue.main.async { WatchG7Reader.shared.standAside(aside) }
         }
+    }
+
+    /// Encryption timeouts on the sensor's link since its last reading (see `deviceManager(_:logEventForDeviceIdentifier:)`).
+    @ObservationIgnored var sensorEncryptTimeouts = 0
+
+    static var sensorRefusalMessage: String {
+        String(
+            localized: "The sensor refuses this watch's Bluetooth pairing. On the watch, open Settings › Bluetooth and forget the DXCM device, then tap Pair Again here and keep Trio open until a glucose value shows; accept the pairing request."
+        )
+    }
+
+    /// The untethered page offers Pair Again: the sensor refuses the watch's pairing, or a pairing is under way and its
+    /// request may not have come.
+    var offersSensorPairAgain: Bool { data.lastError == Self.sensorRefusalMessage || isPairingSensor }
+
+    /// The watch forgets its own pairing with the sensor, as the sensor page's Pair Again does; the next connection
+    /// pairs again.
+    func pairSensorAgain() {
+        Task { await WatchLogger.shared.log("⌚️ Untethered: Pair Again tapped", force: true) }
+        WatchG7Reader.shared.resetWatchPairing()
+        sensorEncryptTimeouts = 0
+        if data.lastError == Self.sensorRefusalMessage { setError(nil) }
     }
 
     func setError(_ message: String?) {
@@ -679,6 +698,8 @@ import WatchKit
         if let meeting = meetingPump {
             meetingPump = nil
             if !meeting.isControlReleased { meeting.releaseControl() }
+            // 3 November, 18:04:55: a takeover beside a search for the new pod didn't find it in 2 minutes
+            Task { await WatchLogger.shared.log("⌚️ Untethered: the takeover let go of the new-pod search's manager and searches with its own", force: true) }
         }
         let pump: PumpManager & ExclusiveDeviceControl
         if let witness, data.session.startedWithoutPhone, data.handover == nil,
@@ -1119,6 +1140,9 @@ import WatchKit
 
     func requestStart() {
         guard WatchState.shared.untetheredMode, data.session.phase == .idle, !isBusy else { return }
+        // a start by hand shows in the log: on 3 November at 18:04:55 one went out 6 s after Trio opened from the
+        // new-pod notice, and nothing showed whether it was tapped
+        Task { await WatchLogger.shared.log("⌚️ Untethered: Start Untethered tapped on the watch", force: true) }
         if let reason = versionMismatch {
             setError(reason)
             return

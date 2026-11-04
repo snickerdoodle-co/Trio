@@ -487,7 +487,9 @@ import Testing
             PumpHistoryEvent(id: "p", type: .pumpSuspend, timestamp: at(45)),
             PumpHistoryEvent(id: "r", type: .pumpResume, timestamp: at(50)),
             // 9 U take 6 minutes: over before the span starts
-            PumpHistoryEvent(id: "old", type: .bolus, timestamp: at(-7), amount: 9)
+            PumpHistoryEvent(id: "old", type: .bolus, timestamp: at(-7), amount: 9),
+            // entered by hand: not the pump's
+            PumpHistoryEvent(id: "pen", type: .bolus, timestamp: at(40), amount: 1, isExternal: true)
         ]
         let expected = UntetheredAudit.expectedDelivery(
             from: at(0),

@@ -64,7 +64,11 @@ enum UntetheredAudit {
         let events = history.sorted { $0.timestamp < $1.timestamp }
 
         // one still running at either edge, as one the phone started just before the watch took over without it
-        let boluses = events.filter { [.bolus, .smb].contains($0.type) }.reduce(Decimal(0)) { sum, bolus in
+        // insulin entered by hand (pen, syringe) never went through the pump: on 3 November a third tester's 1 U
+        // entered on the phone showed as 1.03 U the pump hadn't delivered
+        let boluses = events.filter {
+            [.bolus, .smb].contains($0.type) && $0.isExternal != true && $0.isExternalInsulin != true
+        }.reduce(Decimal(0)) { sum, bolus in
             let units = bolus.deliveredUnits ?? bolus.amount ?? 0
             let length = bolusDeliveryRate > 0 ? NSDecimalNumber(decimal: units).doubleValue / bolusDeliveryRate : 0
             guard length > 0 else { return bolus.timestamp >= start && bolus.timestamp < end ? sum + units : sum }

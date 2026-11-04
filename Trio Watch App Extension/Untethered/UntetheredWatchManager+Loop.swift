@@ -1,6 +1,5 @@
 import Foundation
 import HealthKit
-import LoopAlgorithm
 import LoopKit
 import SwiftUI
 import UserNotifications
@@ -1310,13 +1309,24 @@ extension UntetheredWatchManager: PumpManagerDelegate {
         }
         DispatchQueue.main.async { self.noteSensorPairingEvent(message) }
         // ponytail: matched on G7SensorKit's log line, which is the only place it reports a link error;
-        // move to a delegate call if the kit ever reports one. 14 = the peer removed the pairing,
-        // 15 = encryption timed out: the sensor no longer has this watch's bond.
-        if type == .error, message.contains("CBErrorDomain Code=14") || message.contains("CBErrorDomain Code=15") {
+        // move to a delegate call if the kit ever reports one. 14 = the peer removed the pairing: the sensor no
+        // longer has this watch's bond. 15 = encryption timed out, which a weak link does too: only twice in a row,
+        // with no reading between, counts as a refusal (4 November, 05:08: one, readings went on at 05:13, and the
+        // warning sent the user through two pairings that weren't needed).
+        if message.contains("Sensor didRead") {
             DispatchQueue.main.async {
-                self.setError(String(
-                    localized: "The sensor refuses this watch's Bluetooth pairing. On the watch, open Settings › Bluetooth and forget the DXCM device, then open Trio and keep it open until a glucose value shows; accept the pairing request."
-                ))
+                self.sensorEncryptTimeouts = 0
+                if self.data.lastError == Self.sensorRefusalMessage { self.setError(nil) }
+            }
+        } else if type == .error, message.contains("CBErrorDomain Code=14") || message.contains("CBErrorDomain Code=15") {
+            let removed = message.contains("CBErrorDomain Code=14")
+            DispatchQueue.main.async {
+                self.sensorEncryptTimeouts += removed ? 0 : 1
+                if removed || self.sensorEncryptTimeouts >= 2 {
+                    self.setError(Self.sensorRefusalMessage)
+                } else {
+                    Task { await WatchLogger.shared.log("⌚️ Untethered: the sensor's link timed out while encrypting; a refusal only if the next connect fails the same way", force: true) }
+                }
             }
         }
         completion?(nil)
