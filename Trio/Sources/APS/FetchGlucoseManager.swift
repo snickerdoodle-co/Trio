@@ -324,7 +324,7 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
             return
         }
         // before the filters: a reading the watch already sent is left out as stored, but the phone read it too
-        PhoneOwnGlucose.noteReading(at: newGlucose.map(\.dateString).max())
+        PhoneOwnGlucose.noteReading(newGlucose)
 
         let backfillGlucose = newGlucose.filter { $0.dateString <= syncDate }
         if backfillGlucose.isNotEmpty {
@@ -524,13 +524,29 @@ extension BaseFetchGlucoseManager {
 /// sending the watch's readings back, and the watch took that for the phone being back (30 October, 16:34 to 16:57).
 enum PhoneOwnGlucose {
     private static let key = "untethered.phoneOwnGlucoseDate"
+    private static let valueKey = "untethered.phoneOwnGlucoseMgdl"
+    private static let directionKey = "untethered.phoneOwnGlucoseDirection"
 
     static var newest: Date? {
         UserDefaults.standard.object(forKey: key) as? Date
     }
 
-    static func noteReading(at date: Date?) {
-        guard let date, date > (newest ?? .distantPast) else { return }
-        UserDefaults.standard.set(date, forKey: key)
+    /// The newest reading's value and direction, sent with its date: a watch session whose own sensor link failed
+    /// loops on it instead of handing the pump back (5 November, 02:53 to 03:18: the phone read every 5 minutes,
+    /// the watch nothing).
+    static var newestReading: (mgdl: Int, direction: String)? {
+        let defaults = UserDefaults.standard
+        guard let mgdl = defaults.object(forKey: valueKey) as? Int, mgdl > 0 else { return nil }
+        return (mgdl, defaults.string(forKey: directionKey) ?? "")
+    }
+
+    static func noteReading(_ readings: [BloodGlucose]) {
+        guard let reading = readings.max(by: { $0.dateString < $1.dateString }),
+              reading.dateString > (newest ?? .distantPast)
+        else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(reading.dateString, forKey: key)
+        defaults.set(reading.glucose ?? reading.sgv ?? 0, forKey: valueKey)
+        defaults.set(reading.direction?.rawValue ?? "", forKey: directionKey)
     }
 }

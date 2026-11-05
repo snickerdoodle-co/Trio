@@ -48,6 +48,17 @@ struct UntetheredStatusView: View {
                                 .font(.footnote)
                         }
                     }
+                    if manager.isActive, let since = manager.readingsFromPhoneSince {
+                        card(tint: .orange) {
+                            Label(
+                                String(
+                                    localized: "Readings from iPhone: the watch hasn't read the sensor itself since \((manager.ownReadingAt ?? since).formatted(date: .omitted, time: .shortened)). Without the iPhone there would be no readings."
+                                ),
+                                systemImage: "iphone"
+                            )
+                            .font(.footnote)
+                        }
+                    }
                     if manager.offersSensorPairAgain {
                         // here, not only on the sensor page: where the warning is, and Trio has to stay in front
                         // for the pairing request

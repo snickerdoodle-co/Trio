@@ -45,6 +45,11 @@ import WatchKit
     /// No looks at the pod until then, while the phone's newest reading stays this one: a look the phone sees as
     /// another controller's session holds its dosing up to 3 minutes if the watch can't answer it.
     @ObservationIgnored var fallbackLooksPaused: (phoneNewest: Date, until: Date)?
+    /// The phone's own newest reading, held until the watch's own reading of that cycle had its chance.
+    @ObservationIgnored var pendingPhoneReading: SessionReading?
+    /// The session loops on the phone's readings: when the first was taken since the watch's own last one. Shown on
+    /// the first page and the status page, and warned about after 20 minutes.
+    var readingsFromPhoneSince: Date?
     /// What the log last said about Start by Itself, so it says it again when it changes.
     @ObservationIgnored var loggedFallbackSetting: Bool?
     /// The phone's newest reading when the looks found nobody at the pod: while it stays the newest, a start that
@@ -159,7 +164,9 @@ import WatchKit
         }
         updateReaderStandAside()
         // the first page marks the reading as the watch's own while this mode reads the sensor
-        if WatchState.shared.currentGlucoseIsWatchOwn != isActive { WatchState.shared.currentGlucoseIsWatchOwn = isActive }
+        // the phone's reading shows with the iPhone symbol
+        let watchOwn = isActive && readingsFromPhoneSince == nil
+        if WatchState.shared.currentGlucoseIsWatchOwn != watchOwn { WatchState.shared.currentGlucoseIsWatchOwn = watchOwn }
         // the face's watch symbol: before the readings go to the complication, so their redraw carries the last loop
         ComplicationStore.setUntethered(isActive, lastLoop: data.lastLoopDate)
         if isActive {
@@ -873,8 +880,9 @@ import WatchKit
         Task { await WatchLogger.shared.log("⌚️ Untethered: letting go of the sensor", force: true) }
         saveCGMState()
         cgm.cgmManagerDelegate = nil
-        // an adopted manager only lets go of the sensor: the phone owns its lifecycle and records
-        cgm.delete {}
+        // an adopted manager only lets go of the sensor: the phone owns its lifecycle and records. Async since
+        // LoopKit#685; without a delegate it only stops the sensor link.
+        Task { @MainActor in await cgm.delete() }
         cgmManager = nil
     }
 
@@ -931,6 +939,7 @@ import WatchKit
 
     func recheckCGM() {
         watchCGMRecheckAcquisition(cgmManager)
+        takePendingPhoneReading()
         checkAlarms()
         checkPodLink()
     }
@@ -1651,6 +1660,9 @@ extension UntetheredWatchManager {
         let defaults = UserDefaults.standard
         let now = Date()
         let battery = Self.batteryPercent
+        // the own-reading warning counts from the start
+        defaults.set(now, forKey: Self.ownReadingAtKey)
+        readingsFromPhoneSince = nil
         if started {
             defaults.set(battery, forKey: Self.batteryAtStartKey)
             defaults.set(now, forKey: Self.sessionStartKey)

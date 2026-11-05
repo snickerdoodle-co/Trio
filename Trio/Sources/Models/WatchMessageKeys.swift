@@ -64,6 +64,9 @@ enum WatchMessageKeys {
     static let snoozeUntilDate = "snoozeUntilDate"
     /// The newest reading the phone's own CGM delivered; the glucose values may also hold the watch's own.
     static let phoneOwnGlucoseDate = "phoneOwnGlucoseDate"
+    /// While the watch has the pump: the phone's own newest reading (date, mg/dL, direction), for a session whose
+    /// own sensor link failed.
+    static let untetheredPhoneReading = "untetheredPhoneReading"
     /// The watch app's push token, from the watch: the phone uploads it with its own so a remote command can also go
     /// straight to the watch while it has the pump.
     static let watchPushToken = "watchPushToken"

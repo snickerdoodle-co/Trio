@@ -1163,9 +1163,12 @@ extension UntetheredWatchManager: PumpManagerDelegate {
 
     func pumpManagerMustProvideBLEHeartbeat(_: PumpManager) -> Bool { false }
 
-    func pumpManagerWillDeactivate(_ manager: PumpManager) {
-        guard isSessionPump(manager as AnyObject) else { return }
-        setError(String(localized: "The pod was deactivated. Pair a new one on the phone."))
+    /// LoopKit#685: the old `pumpManagerWillDeactivate`, now awaited by the pump manager's `delete()`.
+    func pumpManagerWantsDeletion(_ manager: PumpManager) async {
+        await MainActor.run {
+            guard self.isSessionPump(manager as AnyObject) else { return }
+            self.setError(String(localized: "The pod was deactivated. Pair a new one on the phone."))
+        }
     }
 
     func pumpManagerPumpWasReplaced(_: PumpManager) {}
@@ -1790,6 +1793,8 @@ extension UntetheredWatchManager: CGMManagerDelegate {
     /// would end the session either, and the watch can't loop without readings. The phone takes the pump back,
     /// as for a pod stall (2026-10-22: a session started at 05:00 got no reading, no loop for 56 minutes).
     func checkSensorStall(now: Date = Date()) {
+        // the phone's reading first: with it the sensor isn't missing
+        takePendingPhoneReading(now: now)
         guard data.session.phase == .active,
               let lastLoop = loopReference,
               now.timeIntervalSince(lastLoop) > Self.sensorStallLimit
@@ -1839,6 +1844,76 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         let direction: BloodGlucose.Direction
     }
 
+    /// A phone reading older than this is no use to the loop.
+    static let phoneReadingMaxAge: TimeInterval = 6 * 60
+    /// The watch's own reading comes within some 40 s of the sensor's burst: the phone's waits this long behind it.
+    static let ownReadingFirst: TimeInterval = 75
+
+    /// The phone's own reading, sent after each one while the watch has the pump: a session whose own sensor link
+    /// failed loops on it instead of handing the pump back (5 November, 02:53 to 03:18: the phone read every
+    /// 5 minutes, the watch got nothing, and after 25 minutes without a loop gave the pump back). The watch's own
+    /// reading stays first; without the phone in reach nothing comes and nothing changes.
+    func receivePhoneReading(_ payload: [String: Any]) {
+        guard let at = payload["date"] as? TimeInterval,
+              let mgdl = (payload["mgdl"] as? NSNumber)?.intValue, mgdl > 0
+        else { return }
+        let reading = SessionReading(
+            date: Date(timeIntervalSince1970: at),
+            mgdl: mgdl,
+            direction: BloodGlucose.Direction(rawValue: payload["direction"] as? String ?? "") ?? .none
+        )
+        DispatchQueue.main.async {
+            guard reading.date > (self.pendingPhoneReading?.date ?? .distantPast) else { return }
+            self.pendingPhoneReading = reading
+            self.takePendingPhoneReading()
+        }
+    }
+
+    /// Takes the phone's held reading once the watch's own for that cycle is overdue, if it still has none.
+    func takePendingPhoneReading(now: Date = Date()) {
+        guard let reading = pendingPhoneReading else { return }
+        let newestOwn = sensorGlucose.map(\.dateString).max() ?? .distantPast
+        // too old, no session, or the watch has this cycle's reading itself
+        guard isActive, now.timeIntervalSince(reading.date) < Self.phoneReadingMaxAge,
+              reading.date.addingTimeInterval(-3.5 * 60) > newestOwn
+        else {
+            pendingPhoneReading = nil
+            return
+        }
+        let wait = reading.date.addingTimeInterval(Self.ownReadingFirst).timeIntervalSince(now)
+        guard wait <= 0 else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.takePendingPhoneReading() }
+            return
+        }
+        pendingPhoneReading = nil
+        let since = newestOwn == .distantPast ? "none" : newestOwn.formatted(date: .omitted, time: .shortened)
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: no reading of its own since \(since), the iPhone's from \(reading.date.formatted(date: .omitted, time: .shortened)) (\(reading.mgdl) mg/dL) into the session",
+                force: true
+            )
+        }
+        takeReadings([reading], fromPhone: true)
+    }
+
+    static let ownReadingAtKey = "untethered.ownReadingAt"
+    /// The newest reading the watch read from the sensor itself in this session, or the session's start.
+    var ownReadingAt: Date? { UserDefaults.standard.object(forKey: Self.ownReadingAtKey) as? Date }
+    /// No reading of its own for this long while looping on the phone's: the watch's sensor link is broken, and
+    /// without the phone there would be no readings at all.
+    static let ownReadingWarnAfter: TimeInterval = 20 * 60
+    static let ownSensorID = notificationPrefix + "ownSensor"
+
+    /// A reading from the sensor itself, also one a phone reading already stands for: the watch's link works.
+    private func noteOwnReading(_ date: Date) {
+        if date > (ownReadingAt ?? .distantPast) { UserDefaults.standard.set(date, forKey: Self.ownReadingAtKey) }
+        guard readingsFromPhoneSince != nil else { return }
+        readingsFromPhoneSince = nil
+        Self.lastAlarm["ownSensor"] = nil
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.ownSensorID])
+        Task { await WatchLogger.shared.log("⌚️ Untethered: the watch reads the sensor itself again", force: true) }
+    }
+
     /// The watch's own G7 reader's readings since the phone's newest, into a session the fallback started: it took
     /// over because the reader had them, and without them the session began with the phone's last reading. On
     /// 22 October at 17:22, a minute in, it sounded "no glucose reading for 31 minutes" and waited for its own sensor
@@ -1866,8 +1941,9 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         })
     }
 
-    func takeReadings(_ readings: [SessionReading]) {
+    func takeReadings(_ readings: [SessionReading], fromPhone: Bool = false) {
         guard isActive, !readings.isEmpty else { return }
+        if !fromPhone, let newest = readings.map(\.date).max() { noteOwnReading(newest) }
         let known = Set(sensorGlucose.map { Int($0.dateString.timeIntervalSince1970 / 30) })
         // as `GlucoseStorage.filterTooFrequentGlucose`: a new reading within 3.5 min of the previous one is
         // dropped; older readings are backfill and only need to be new (a manual BG doesn't count)
@@ -1883,6 +1959,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
             fresh.append(sample)
         }
         guard !fresh.isEmpty else { return }
+        if fromPhone, readingsFromPhoneSince == nil { readingsFromPhoneSince = Date() }
         let epoch = data.session.epoch
         for sample in fresh {
             let value = sample.mgdl
@@ -2010,6 +2087,18 @@ extension UntetheredWatchManager {
            now.timeIntervalSince(lastLoop) > Self.notLoopingAfter
         {
             alarm("loop", title: Self.notLoopingTitle, body: Self.notLoopingBody, every: 30 * 60)
+        }
+        // looping on the phone's readings hides a broken link of the watch's own: said after 20 minutes
+        if readingsFromPhoneSince != nil, let own = ownReadingAt, now.timeIntervalSince(own) > Self.ownReadingWarnAfter {
+            let minutes = Int(now.timeIntervalSince(own) / 60)
+            alarm(
+                "ownSensor",
+                title: String(localized: "Watch Not Reading the Sensor"),
+                body: String(
+                    localized: "The watch has had no sensor reading of its own for \(minutes) minutes and loops on the iPhone's. Without the iPhone it would have none: keep the watch near the sensor, or open Trio on the watch to reconnect."
+                ),
+                every: 30 * 60
+            )
         }
     }
 

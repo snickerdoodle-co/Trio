@@ -336,6 +336,10 @@ import WatchConnectivity
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         if Self.handleLineLogAck(userInfo) { return }
         if WatchLogger.shared.handlePhoneMessage(userInfo) { return }
+        if let reading = userInfo[WatchMessageKeys.untetheredPhoneReading] as? [String: Any] {
+            UntetheredWatchManager.shared.receivePhoneReading(reading)
+            return
+        }
         if userInfo[UntetheredEnvelope.key] != nil {
             UntetheredWatchManager.shared.receive(userInfo, replyHandler: nil)
             return

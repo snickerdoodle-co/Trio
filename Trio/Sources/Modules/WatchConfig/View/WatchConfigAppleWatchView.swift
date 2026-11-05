@@ -176,7 +176,7 @@ struct WatchConfigAppleWatchView: BaseView {
                             "When this is on, the watch runs a workout with each untethered session, from the start to the hand-back. watchOS doesn't suspend an app with a running workout, so Trio stays awake between sensor readings: fewer readings and loops are missed, and its own checks keep running."
                         )
                         Text(
-                            "The workout is discarded at the end: it doesn't appear in the Fitness app or count toward the activity rings. It collects only the heart rate, for the minimal screen. The first start asks on the watch for permission to use workouts and read the heart rate."
+                            "The workout is discarded at the end, so it isn't saved as a workout in the Fitness app. While it runs, the watch still counts it toward the Activity rings, the Exercise minutes in particular, as with any workout. It collects only the heart rate, for the minimal screen. The first start asks on the watch for permission to use workouts and read the heart rate."
                         )
                         Text("While it runs:")
                         Text(
