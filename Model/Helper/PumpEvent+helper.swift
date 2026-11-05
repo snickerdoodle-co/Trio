@@ -72,6 +72,9 @@ public extension PumpEventStored {
         case nsExercise = "Exercise"
         /// A time the Apple Watch had the pump (untethered), for followers to show like an override.
         case nsUntethered = "Untethered Watch"
+        /// A G7 reading the sensor marks unreliable, for followers (LoopFollow) to show greyed; its own type, so
+        /// nothing reads it as a BG check.
+        case nsUnreliableGlucose = "Unreliable Glucose"
         case capillaryGlucose = "BG Check"
     }
 

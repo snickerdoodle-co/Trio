@@ -826,6 +826,9 @@ struct MainChartCanvas: View {
 
     @State var basalProfiles: [BasalProfile] = []
     @State var preparedTempBasals: [PreparedTempBasal] = []
+    /// The G7's unreliable readings, drawn as hollow dots. Observed here, in the canvas that draws them: its
+    /// `.equatable()` skips updates from the parent, while this object's changes still redraw it.
+    @ObservedObject var unsureStore = UnsureGlucoseStore.shared
     /// Cached, not computed: Swift Charts reads this once per mark, so rescanning both series per read is quadratic.
     @State var basalDomainMax: Double = 0.1
 
@@ -982,7 +985,8 @@ extension MainChartCanvas {
                 lowGlucose: state.lowGlucose,
                 currentGlucoseTarget: state.currentGlucoseTarget,
                 isSmoothingEnabled: state.isSmoothingEnabled,
-                glucoseColorScheme: state.glucoseColorScheme
+                glucoseColorScheme: state.glucoseColorScheme,
+                unsureData: unsureStore.readings
             )
         }
         .frame(width: canvasWidth, height: mainHeight)

@@ -22,6 +22,13 @@ struct CurrentGlucoseView: View {
     /// Wall-clock end of the warmup window. Drives the warmup countdown tag.
     var cgmWarmupEndsAt: Date?
 
+    /// A reading the G7 marks unreliable, shown greyed with a warning when it's newer than the last reliable one.
+    @ObservedObject var unsureStore = UnsureGlucoseStore.shared
+    private var unsureReading: UnsureGlucose? {
+        _ = timerDate
+        return unsureStore.current(after: glucose.last?.date)
+    }
+
     @State private var rotationDegrees: Double = 0.0
     @State private var angularGradient = AngularGradient(colors: [
         Color(red: 0.7215686275, green: 0.3411764706, blue: 1),
@@ -98,7 +105,7 @@ struct CurrentGlucoseView: View {
                 )
             }
 
-            TrendShape(gradient: angularGradient, color: triangleColor, showArrow: true)
+            TrendShape(gradient: angularGradient, color: triangleColor, showArrow: unsureReading == nil)
                 .rotationEffect(.degrees(rotationDegrees))
 
             VStack(alignment: .center) {
@@ -194,6 +201,12 @@ struct CurrentGlucoseView: View {
     /// One combined VoiceOver description for the bobble, e.g.
     /// "Glucose 79 mg/dL, in range, falling, delta -2, 1 minute ago".
     private var bobbleAccessibilityLabel: String {
+        if let unsure = unsureReading {
+            return String(localized: "Glucose", comment: "Accessibility: glucose label") +
+                " \(Decimal(unsure.mgdl).formatted(for: units)) \(units.rawValue), " +
+                String(localized: "not reliable: the sensor reports an issue", comment: "Accessibility: unreliable G7 reading") +
+                ", " + TimeAgoFormatter.minutesAgoAccessible(from: unsure.date)
+        }
         guard let glucoseValue = glucose.last?.glucose, isReadingFresh else {
             return String(localized: "Glucose unavailable", comment: "Accessibility: no fresh glucose")
         }
@@ -216,6 +229,27 @@ struct CurrentGlucoseView: View {
     }
 
     @ViewBuilder private func bobbleContent() -> some View {
+        if let unsure = unsureReading {
+            HStack(spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title3)
+                    .foregroundStyle(.orange)
+                Text(Decimal(unsure.mgdl).formatted(for: units))
+                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Text(TimeAgoFormatter.minutesAgo(from: unsure.date))
+                Text("Not reliable")
+            }
+            .font(.callout).fontWeight(.bold)
+            .foregroundStyle(.orange)
+        } else {
+            reliableBobbleContent()
+        }
+    }
+
+    @ViewBuilder private func reliableBobbleContent() -> some View {
         HStack {
             if let glucoseValue = glucose.last?.glucose, isReadingFresh {
                 let displayGlucose = Decimal(glucoseValue).formatted(for: units)
@@ -261,6 +295,7 @@ struct CurrentGlucoseView: View {
     /// countdown carry useful info, so the bobble stays.
     private var stalenessState: (imageName: String, label: String, color: Color)? {
         guard !isReadingFresh,
+              unsureReading == nil,
               !isInWarmup,
               let status = cgmStatus,
               !status.imageName.isEmpty

@@ -913,6 +913,13 @@ import WatchKit
     func session(_: WatchG7Session, didRead message: WatchG7GlucoseMessage, receivedAt: Date) {
         DispatchQueue.main.async {
             guard message.hasReliableGlucose, let glucose = message.glucose else {
+                // a value the sensor marks unreliable: shown greyed with a warning, never used
+                if let glucose = message.glucose {
+                    WatchState.shared.noteUnsureGlucose(
+                        mgdl: Int(glucose),
+                        date: receivedAt.addingTimeInterval(-TimeInterval(message.age))
+                    )
+                }
                 let problem = String(describing: message.algorithmState)
                 self.sensorProblem = problem
                 self.appendLog("Sensor answered without a reading (\(problem))")

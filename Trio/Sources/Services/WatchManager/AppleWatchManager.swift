@@ -91,6 +91,16 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             }
             .store(in: &subscriptions)
 
+        // a G7 reading marked unreliable goes to the watch too, shown there greyed with a warning
+        UnsureGlucoseStore.shared.$readings
+            .dropFirst()
+            .receive(on: DispatchQueue.global(qos: .background))
+            .sink { [weak self] _ in
+                guard let self = self, let session = self.session, self.watchNeedsState(session) else { return }
+                self.pushWatchState()
+            }
+            .store(in: &subscriptions)
+
         iobService.iobPublisher
             .receive(on: DispatchQueue.global(qos: .background))
             .sink { [weak self] _ in
@@ -592,6 +602,12 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
         // the readings above include the watch's own the phone stored; this says when the phone itself last read one
         if let own = PhoneOwnGlucose.newest {
             dictionary[WatchMessageKeys.phoneOwnGlucoseDate] = own.timeIntervalSince1970
+        }
+        if let unsure = UnsureGlucoseStore.shared.latest,
+           Date().timeIntervalSince(unsure.date) < UnsureGlucoseStore.freshFor
+        {
+            dictionary[WatchMessageKeys.unsureGlucoseMgdl] = unsure.mgdl
+            dictionary[WatchMessageKeys.unsureGlucoseDate] = unsure.date.timeIntervalSince1970
         }
         dictionary[WatchMessageKeys.remoteControlSecret] = Self.remoteControlSecretForWatch(settingsManager.settings)
 

@@ -10,9 +10,27 @@ struct GlucoseChartView: ChartContent {
     let currentGlucoseTarget: Decimal
     let isSmoothingEnabled: Bool
     let glucoseColorScheme: GlucoseColorScheme
+    /// Readings the G7 marked unreliable: hollow orange dots, apart from the stored readings.
+    var unsureData: [UnsureGlucose] = []
 
     var body: some ChartContent {
         drawGlucoseChart()
+        drawUnsureGlucose()
+    }
+
+    private func drawUnsureGlucose() -> some ChartContent {
+        ForEach(unsureData, id: \.date) { item in
+            PointMark(
+                x: .value("Time", item.date, unit: .second),
+                y: .value("Value", units == .mgdL ? Decimal(item.mgdl) : Decimal(item.mgdl).asMmolL)
+            )
+            .symbolSize(20)
+            .symbol {
+                Circle()
+                    .strokeBorder(Color.orange, lineWidth: 1.5)
+                    .frame(width: 7, height: 7)
+            }
+        }
     }
 
     /// Dynamic point color for a CGM reading. Manual readings render red and skip this.

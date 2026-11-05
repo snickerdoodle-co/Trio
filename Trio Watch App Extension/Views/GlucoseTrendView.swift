@@ -19,11 +19,23 @@ struct GlucoseTrendView: View {
         directReading != nil || state.currentGlucoseIsWatchOwn
     }
 
+    /// A reading the G7 marked unreliable, newer than the reliable one shown and fresh: greyed with a warning sign.
+    private var unsureReading: (date: Date, mgdl: Int)? {
+        guard let date = state.unsureGlucoseDate, let mgdl = state.unsureGlucoseMgdl,
+              Date().timeIntervalSince(date) < 12 * 60
+        else { return nil }
+        let shown = [directReading?.date, state.glucoseValues.last?.date].compactMap { $0 }.max() ?? .distantPast
+        return date > shown ? (date, mgdl) : nil
+    }
+
     private var showsGlucose: Bool {
-        !isWatchStateDated || directReading != nil
+        !isWatchStateDated || directReading != nil || unsureReading != nil
     }
 
     private var glucoseText: String {
+        if let unsureReading {
+            return reader.format(Double(unsureReading.mgdl))
+        }
         if let directReading {
             return reader.format(Double(directReading.glucose))
         }
@@ -31,6 +43,7 @@ struct GlucoseTrendView: View {
     }
 
     private var glucoseColor: Color {
+        if unsureReading != nil { return Color.secondary }
         if let directReading {
             let glucose = Double(directReading.glucose)
             if glucose <= (reader.lowMgDL ?? 70) { return Color.loopRed }
@@ -41,6 +54,7 @@ struct GlucoseTrendView: View {
     }
 
     private var deltaText: String? {
+        if unsureReading != nil { return nil }
         if directReading != nil {
             return reader.deltaText ?? "--"
         }
@@ -49,6 +63,13 @@ struct GlucoseTrendView: View {
     }
 
     private var bottomText: String {
+        if let unsureReading {
+            let minutes = max(0, Int(Date().timeIntervalSince(unsureReading.date) / 60))
+            return String(
+                localized: "Not reliable · \(minutes) min",
+                comment: "Shown under a glucose value the G7 itself marks unreliable (minutes since the reading)"
+            )
+        }
         // the sensor's own state, when it sends no glucose: the reason, not "stale"
         if let label = reader.sensorProblemLabel, !reader.isStandingAside,
            (reader.latest.map { Date().timeIntervalSince($0.date) > 6 * 60 } ?? true)
@@ -224,8 +245,13 @@ struct GlucoseTrendView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    // a sensor problem first: a yellow triangle catches the eye, page 3 says what it is
-                    if reader.showsSensorWarning {
+                    // a value the sensor marks unreliable: an orange warning sign with it
+                    if unsureReading != nil {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("Not reliable: the sensor reports an issue")
+                    } else if reader.showsSensorWarning {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .font(.system(size: 13))
                             .foregroundStyle(.yellow)

@@ -1825,7 +1825,11 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         )
     }
 
-    func cgmManager(_: CGMManager, hasNew readingResult: CGMReadingResult) {
+    func cgmManager(_ manager: CGMManager, hasNew readingResult: CGMReadingResult) {
+        // a value the sensor marks unreliable: shown greyed with a warning, never looped on
+        if isActive, let unsure = watchCGMUnreliableReading(manager) {
+            WatchState.shared.noteUnsureGlucose(mgdl: unsure.mgdl, date: unsure.date)
+        }
         // outside a session the link only stays warm; the phone reads the same sensor
         guard isActive, case let .newData(samples) = readingResult, !samples.isEmpty else { return }
         sensorPairingDone()

@@ -43,6 +43,14 @@ func watchCGMSensorProblem(_ manager: CGMManager?, now: Date = Date()) -> WatchS
     return nil
 }
 
+/// The sensor's newest message, when it carries a value the sensor marks unreliable: shown greyed, never used.
+func watchCGMUnreliableReading(_ manager: CGMManager?) -> (date: Date, mgdl: Int)? {
+    guard let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
+          let glucose = message.glucose, let at = g7.latestReadingTimestamp
+    else { return nil }
+    return (at, Int(glucose))
+}
+
 /// On a wake that isn't the sensor's own, the G7's acquisition re-checks itself: a lost Bluetooth
 /// callback can leave no connect standing and nothing that notices.
 func watchCGMRecheckAcquisition(_ manager: CGMManager?) {

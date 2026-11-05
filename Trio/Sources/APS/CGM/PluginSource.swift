@@ -152,7 +152,7 @@ extension PluginSource: CGMManagerDelegate {
         await glucoseManager?.deleteGlucoseSource()
     }
 
-    func cgmManager(_: CGMManager, hasNew readingResult: CGMReadingResult) {
+    func cgmManager(_ manager: CGMManager, hasNew readingResult: CGMReadingResult) {
         processQueue.async { [weak self] in
             guard let self = self else { return }
 
@@ -163,6 +163,13 @@ extension PluginSource: CGMManagerDelegate {
                 self.glucoseManager?.newGlucoseFromCgmManager(newGlucose: glucose)
             case let .failure(error):
                 debug(.cgm, "CGM reading not usable: \(error.localizedDescription)")
+                // the G7 sent a value it marks unreliable: shown greyed, never used
+                if let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
+                   let glucose = message.glucose, let date = g7.latestReadingTimestamp
+                {
+                    UnsureGlucoseStore.shared.add(UnsureGlucose(date: date, mgdl: Int(glucose)))
+                    debug(.cgm, "G7 reading \(glucose) mg/dL marked \(message.algorithmState): shown greyed with a warning, not used")
+                }
             }
 
             self.glucoseManager?.reportCGMSensorObservation(self.currentSensorObservation())
@@ -358,5 +365,61 @@ extension PluginSource: CGMManagerDelegate {
 extension PluginSource {
     func sourceInfo() -> [String: Any]? {
         [GlucoseSourceKey.description.rawValue: "Plugin CGM source"]
+    }
+}
+
+/// A G7 reading the sensor itself marks unreliable ("Brief sensor issue", 5 November: about 75 minutes of a workout
+/// for the third tester, with values that followed the trend). Never stored, looped on, alarmed on, uploaded or sent
+/// to Health: Home shows it greyed with a warning sign and the chart as hollow orange dots, so a workout isn't spent
+/// without any idea where glucose is going. Asked for by the first tester.
+struct UnsureGlucose: Codable, Equatable {
+    let date: Date
+    let mgdl: Int
+}
+
+final class UnsureGlucoseStore: ObservableObject {
+    static let shared = UnsureGlucoseStore()
+
+    /// Kept as long as the chart reaches back.
+    static let keep: TimeInterval = 24 * 60 * 60
+    /// Shown on Home and the watch while this fresh, as a reliable reading would be.
+    static let freshFor: TimeInterval = 12 * 60
+
+    /// The flagged readings, oldest first; kept across restarts and new builds.
+    @Published private(set) var readings: [UnsureGlucose] = [] {
+        didSet {
+            if let data = try? JSONEncoder().encode(readings) { UserDefaults.standard.set(data, forKey: Self.storageKey) }
+        }
+    }
+
+    private static let storageKey = "trio.unsureGlucose"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: Self.storageKey),
+           let saved = try? JSONDecoder().decode([UnsureGlucose].self, from: data)
+        {
+            let now = Date()
+            readings = saved.filter { now.timeIntervalSince($0.date) < Self.keep }
+        }
+    }
+
+    var latest: UnsureGlucose? { readings.last }
+
+    /// The newest flagged reading while fresh and newer than the newest reliable one.
+    func current(after reliable: Date?, now: Date = Date()) -> UnsureGlucose? {
+        guard let latest, now.timeIntervalSince(latest.date) < Self.freshFor,
+              latest.date > (reliable ?? .distantPast)
+        else { return nil }
+        return latest
+    }
+
+    func add(_ reading: UnsureGlucose) {
+        DispatchQueue.main.async {
+            guard !self.readings.contains(where: { abs($0.date.timeIntervalSince(reading.date)) < 60 }) else { return }
+            let now = Date()
+            self.readings = (self.readings + [reading])
+                .filter { now.timeIntervalSince($0.date) < Self.keep }
+                .sorted { $0.date < $1.date }
+        }
     }
 }

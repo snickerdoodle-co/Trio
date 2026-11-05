@@ -150,6 +150,20 @@ import WatchConnectivity
     /// The current glucose is the watch's own reading (untethered mode), not the phone's.
     var currentGlucoseIsWatchOwn = false
 
+    /// The newest G7 reading the sensor marked unreliable ("Brief sensor issue"), from the phone, the watch's own
+    /// reader or untethered mode: shown greyed with a warning sign while newer than the last reliable reading,
+    /// never looped on or alarmed on.
+    var unsureGlucoseMgdl: Int?
+    var unsureGlucoseDate: Date?
+
+    func noteUnsureGlucose(mgdl: Int, date: Date) {
+        DispatchQueue.main.async {
+            guard date > (self.unsureGlucoseDate ?? .distantPast) else { return }
+            self.unsureGlucoseMgdl = mgdl
+            self.unsureGlucoseDate = date
+        }
+    }
+
     /// Kept, so the lines and the time-in-range bar stay while the phone is away and after a relaunch.
     var chartLowMgDL: Double? = UserDefaults.standard.object(forKey: "chartLowMgDL") as? Double {
         didSet { UserDefaults.standard.set(chartLowMgDL, forKey: "chartLowMgDL") }
@@ -619,6 +633,12 @@ import WatchConnectivity
                 )
             }
             .sorted { $0.date < $1.date }
+        }
+
+        if let at = message[WatchMessageKeys.unsureGlucoseDate] as? TimeInterval,
+           let mgdl = (message[WatchMessageKeys.unsureGlucoseMgdl] as? NSNumber)?.intValue
+        {
+            noteUnsureGlucose(mgdl: mgdl, date: Date(timeIntervalSince1970: at))
         }
 
         if let minYAxisValue = message[WatchMessageKeys.minYAxisValue] {
