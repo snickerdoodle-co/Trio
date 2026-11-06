@@ -52,6 +52,7 @@ extension UntetheredWatchManager {
         ) { [weak self] in
             self?.loopHoldExpired = true
         }
+        Self.trace("loop started (\(trigger))")
         Task { @MainActor in
             defer {
                 self.isLooping = false
@@ -67,6 +68,7 @@ extension UntetheredWatchManager {
             // the pod only once the sensor's link is closed (see `waitForSensorQuiet`)
             if trigger == .newGlucose {
                 await self.waitForSensorQuiet()
+                Self.trace("sensor link quiet, to the pod")
                 // the session may have ended meanwhile (2026-10-23 08:25:46: a loop ran on after the hand-back)
                 guard self.isActive else { return }
             }
@@ -967,7 +969,7 @@ extension UntetheredWatchManager {
         let glucose = BloodGlucose(
             id: UUID().uuidString,
             mbg: mgdl,
-            date: Decimal(Int(now.timeIntervalSince1970 * 1000)),
+            date: Decimal(Int64(now.timeIntervalSince1970 * 1000)), // Int64: see takeReadings
             dateString: now,
             glucose: mgdl,
             type: "mbg"
@@ -1832,6 +1834,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         }
         // outside a session the link only stays warm; the phone reads the same sensor
         guard isActive, case let .newData(samples) = readingResult, !samples.isEmpty else { return }
+        Self.trace("reading in: \(samples.count) sample(s), newest from \(samples.map(\.date).max()?.formatted(date: .omitted, time: .standard) ?? "-")")
         sensorPairingDone()
         takeReadings(samples.filter { !$0.wasUserEntered }.map {
             SessionReading(
@@ -1971,7 +1974,9 @@ extension UntetheredWatchManager: CGMManagerDelegate {
                 id: UUID().uuidString,
                 sgv: value,
                 direction: sample.direction,
-                date: Decimal(Int(sample.date.timeIntervalSince1970 * 1000)),
+                // Int64: on a watch with 32-bit Int (arm64_32: Apple Watch SE, Series 4 to 8) milliseconds since 1970
+                // overflow Int, and the app crashed at every reading (third tester, 3 and 4 November, Watch6,10)
+                date: Decimal(Int64(sample.date.timeIntervalSince1970 * 1000)),
                 dateString: sample.date,
                 unfiltered: Decimal(value),
                 glucose: value,
@@ -1983,6 +1988,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
                 epoch: epoch
             )
         }
+        Self.trace("stored \(fresh.count) reading(s) in the session")
         smoothGlucose()
         refresh()
         checkAlarms()
@@ -1992,7 +1998,14 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         checkPodLink()
         readingArrivals.append(Date())
         if readingArrivals.count > 24 { readingArrivals.removeFirst(readingArrivals.count - 24) }
+        Self.trace("reading handled, loop next")
         runLoop(.newGlucose)
+    }
+
+    /// Steps along a reading's way to the pod, in the watch's log file at once (5 November, third tester: twice
+    /// watchOS ended the app within seconds of a reading, with no report; these show the step it was in).
+    static func trace(_ step: String) {
+        Task { await WatchLogger.shared.log("⌚️ Untethered trace: \(step)") }
     }
 
     func cgmManager(_: CGMManager, hasNew _: [PersistedCgmEvent]) {}
