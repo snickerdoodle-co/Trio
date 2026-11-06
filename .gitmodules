@@ -41,7 +41,7 @@
 [submodule "OmnipodKit"]
 	path = OmnipodKit
 	url = https://github.com/kristinkand/OmnipodKit.git
-	branch = untethered-next-dev
+	branch = untethered-personal
 [submodule "AccuChekKit"]
 	path = AccuChekKit
 	url = https://github.com/loopandlearn/AccuChekKit

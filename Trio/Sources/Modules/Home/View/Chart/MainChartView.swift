@@ -308,6 +308,13 @@ extension MainChartView {
         return state.glucoseFromPersistence.first { $0.date.map(range.contains) ?? false }
     }
 
+    /// A reading the G7 marked unreliable under the scrub, where no stored reading is: the scrub stops on it as on
+    /// any other, and Home's readout shows it with its warning sign.
+    var selectedUnsure: UnsureGlucose? {
+        guard selectedGlucose == nil, let selection = selection else { return nil }
+        return ChartSelectionLookup.unsure(at: selection, in: UnsureGlucoseStore.shared.readings)
+    }
+
     private func findDetermination(in range: ClosedRange<Date>) -> OrefDetermination? {
         let now = Date.now
         return state.enactedAndNonEnactedDeterminations.first {
@@ -338,7 +345,11 @@ extension MainChartView {
     }
 
     private func glucoseYPosition(for glucose: GlucoseStored) -> CGFloat {
-        let value = units == .mgdL ? Decimal(glucose.glucose) : Decimal(glucose.glucose).asMmolL
+        glucoseYPosition(mgdl: Int(glucose.glucose))
+    }
+
+    private func glucoseYPosition(mgdl: Int) -> CGFloat {
+        let value = units == .mgdL ? Decimal(mgdl) : Decimal(mgdl).asMmolL
         let domain = paddedGlucoseYDomain
         let span = domain.upperBound - domain.lowerBound
         let fraction = span == 0 ? 0.5 :
@@ -385,18 +396,32 @@ extension MainChartView {
 
     /// Vertical indicator + point highlights for the selection, positioned with the same
     /// linear maps the canvas uses. The readout itself is Home's (`ChartSelectionRow`).
+    /// Where the selection's marker sits: a stored reading, or else a reading the G7 marked unreliable (hollow,
+    /// orange, as it is drawn).
+    private var selectionPoint: (date: Date, y: CGFloat, color: Color, unsure: Bool)? {
+        if let selectedGlucose, let date = selectedGlucose.date {
+            let color = selectionMarkColor(
+                for: selectedGlucose,
+                highGlucose: highGlucose,
+                lowGlucose: lowGlucose,
+                currentGlucoseTarget: currentGlucoseTarget,
+                glucoseColorScheme: glucoseColorScheme
+            )
+            return (date, glucoseYPosition(for: selectedGlucose), color, false)
+        }
+        if let selectedUnsure {
+            return (selectedUnsure.date, glucoseYPosition(mgdl: selectedUnsure.mgdl), Color.orange, true)
+        }
+        return nil
+    }
+
     @ViewBuilder private var selectionOverlay: some View {
-        if let selectedGlucose, let selectionDate = selectedGlucose.date {
+        if let point = selectionPoint {
+            let selectionDate = point.date
             let x = xPosition(for: selectionDate)
             if x >= 0, x <= viewportWidth {
-                let markColor = selectionMarkColor(
-                    for: selectedGlucose,
-                    highGlucose: highGlucose,
-                    lowGlucose: lowGlucose,
-                    currentGlucoseTarget: currentGlucoseTarget,
-                    glucoseColorScheme: glucoseColorScheme
-                )
-                let glucoseY = glucoseYPosition(for: selectedGlucose)
+                let markColor = point.color
+                let glucoseY = point.y
 
                 // Vertical indicator through all three panes.
                 Rectangle()
@@ -404,13 +429,19 @@ extension MainChartView {
                     .frame(width: 2, height: stackHeight)
                     .position(x: x, y: stackHeight / 2)
 
-                // Selected glucose highlight.
-                Circle().fill(markColor)
-                    .frame(width: 15, height: 15)
-                    .position(x: x, y: glucoseY)
-                Circle().fill(Color.primary)
-                    .frame(width: 6, height: 6)
-                    .position(x: x, y: glucoseY)
+                // Selected glucose highlight; an unreliable reading's stays hollow, as its dot.
+                if point.unsure {
+                    Circle().strokeBorder(markColor, lineWidth: 3)
+                        .frame(width: 15, height: 15)
+                        .position(x: x, y: glucoseY)
+                } else {
+                    Circle().fill(markColor)
+                        .frame(width: 15, height: 15)
+                        .position(x: x, y: glucoseY)
+                    Circle().fill(Color.primary)
+                        .frame(width: 6, height: 6)
+                        .position(x: x, y: glucoseY)
+                }
 
                 // Selected COB / (scaled) IOB dots on the bottom pane, at the
                 // determination's own timestamp: the lookup picks the newest
@@ -614,6 +645,7 @@ extension MainChartView {
     private func hasGlucoseReading(near date: Date) -> Bool {
         let range = date.addingTimeInterval(-150) ... date.addingTimeInterval(150)
         return state.glucoseFromPersistence.contains { $0.date.map(range.contains) ?? false }
+            || ChartSelectionLookup.unsure(at: date, in: UnsureGlucoseStore.shared.readings) != nil
     }
 
     /// While scrubbing, a finger resting in the viewport's edge zones auto-pans the chart

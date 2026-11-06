@@ -23,11 +23,11 @@ extension Home.RootView {
             // Renders from the last resolved selection, which is deliberately not cleared on
             // decay: the row has to keep its values to fade out with, and it is invisible
             // (and untouchable) for as long as no readout is showing.
-            if let readoutDate = chartReadoutDate,
-               let selectedGlucose = ChartSelectionLookup.glucose(at: readoutDate, in: state.glucoseFromPersistence)
-            {
+            // a reading the G7 marked unreliable counts where no stored reading is
+            if let readoutDate = chartReadoutDate, let readout = chartReadoutGlucose(at: readoutDate) {
                 ChartSelectionRow(
-                    selectedGlucose: selectedGlucose,
+                    selectedGlucose: readout.glucose,
+                    unsure: readout.unsure,
                     determination: chartReadoutDeterminationDate.flatMap {
                         ChartSelectionLookup.determination(at: $0, in: state.enactedAndNonEnactedDeterminations)
                     },
@@ -56,11 +56,22 @@ extension Home.RootView {
     ///
     /// `@MainActor` because the continuation after the decay sleep would otherwise resume off
     /// the main actor, writing view state from the wrong one.
+    /// The stored reading at the scrub, or else a reading the G7 marked unreliable there; nil with neither.
+    func chartReadoutGlucose(at date: Date) -> (glucose: GlucoseStored?, unsure: UnsureGlucose?)? {
+        if let glucose = ChartSelectionLookup.glucose(at: date, in: state.glucoseFromPersistence) {
+            return (glucose, nil)
+        }
+        if let unsure = ChartSelectionLookup.unsure(at: date, in: UnsureGlucoseStore.shared.readings) {
+            return (nil, unsure)
+        }
+        return nil
+    }
+
     @MainActor func updateChartReadout() async {
         if let selection = chartSelection {
             var resolvedAnything = false
 
-            if ChartSelectionLookup.glucose(at: selection, in: state.glucoseFromPersistence) != nil {
+            if chartReadoutGlucose(at: selection) != nil {
                 chartReadoutDate = selection
                 resolvedAnything = true
             }
