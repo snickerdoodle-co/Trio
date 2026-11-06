@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import UserNotifications
 import WatchConnectivity
+import WatchKit
 
 /// WatchState manages the communication between the Watch app and the iPhone app using WatchConnectivity.
 /// It handles glucose data synchronization and sending treatment requests (bolus, carbs) to the phone.
@@ -830,6 +831,9 @@ import WatchConnectivity
             }
         }
 
+        // the watch's battery back to the phone, which uploads it for LoopFollow
+        reportBatteryIfChanged()
+
         // Sensor details, alarm thresholds and units for the watch's own G7 reading.
         WatchG7Reader.shared.updateFromPhone(message)
         // a session the fallback started goes back once the phone sends fresh readings again
@@ -844,5 +848,42 @@ import WatchConnectivity
                 targetMgDL: message["complicationTargetMgDL"] as? Double
             )
         }
+    }
+}
+
+// MARK: - Watch battery for the phone
+
+extension WatchState {
+    /// The last battery level sent to the phone.
+    private static var lastBatteryReport: (percent: Int, charging: Bool, at: Date)?
+
+    /// Sends the watch's battery to the phone when it changed or every 30 minutes; the phone puts it in the
+    /// device status it uploads, and LoopFollow shows it next to the phone's (asked for by the first tester).
+    /// As userInfo: queued, so it also gets there when the phone is away for a while; only the newest is kept.
+    func reportBatteryIfChanged(now: Date = Date()) {
+        let device = WKInterfaceDevice.current()
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }
+        let level = device.batteryLevel
+        guard level >= 0 else { return }
+        let percent = Int((level * 100).rounded())
+        let charging = device.batteryState == .charging || device.batteryState == .full
+        if let last = Self.lastBatteryReport, last.percent == percent, last.charging == charging,
+           now.timeIntervalSince(last.at) < 30 * 60
+        {
+            return
+        }
+        let session = WCSession.default
+        guard WCSession.isSupported(), session.activationState == .activated else { return }
+        Self.lastBatteryReport = (percent, charging, now)
+        for transfer in session.outstandingUserInfoTransfers where transfer.userInfo[WatchMessageKeys.watchBattery] != nil {
+            transfer.cancel()
+        }
+        session.transferUserInfo([
+            WatchMessageKeys.watchBattery: [
+                "percent": percent,
+                "charging": charging,
+                "date": now.timeIntervalSince1970
+            ]
+        ])
     }
 }

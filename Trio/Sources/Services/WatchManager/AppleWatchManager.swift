@@ -1047,6 +1047,10 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             Self.storeWatchPushToken(token)
             return
         }
+        if let battery = userInfo[WatchMessageKeys.watchBattery] as? [String: Any] {
+            WatchBattery.store(battery)
+            return
+        }
         if userInfo["watchLogs"] != nil {
             Self.confirmWatchLogs(WatchLogIngest.acceptLegacy(userInfo))
         }

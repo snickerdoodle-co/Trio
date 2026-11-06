@@ -115,7 +115,8 @@ struct CurrentGlucoseView: View {
         .overlay(alignment: .bottom) {
             // Overlay (not VStack) so the tag doesn't push siblings down;
             // hidden when the trend arrow rotates toward 6 o'clock.
-            if let tag = tagLabel, !trendIsDownward {
+            // with an unreliable reading the trend arrow is hidden, so the tag can't collide with it
+            if let tag = tagLabel, !trendIsDownward || unsureReading != nil {
                 SensorStatusTagView(text: tag.text, theme: tag.theme, iconSystemName: tag.icon)
                     .offset(y: 14)
                     .zIndex(1)
@@ -230,17 +231,14 @@ struct CurrentGlucoseView: View {
 
     @ViewBuilder private func bobbleContent() -> some View {
         if let unsure = unsureReading {
+            // value and warning sign in the one color; "Sensor issue: not reliable" is the tag under the bobble,
+            // as it didn't fit inside
+            Text(Decimal(unsure.mgdl).formatted(for: units))
+                .font(.system(size: 40, weight: .bold, design: .rounded))
+                .foregroundStyle(.orange)
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.title3)
-                    .foregroundStyle(.orange)
-                Text(Decimal(unsure.mgdl).formatted(for: units))
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
-                    .foregroundStyle(.secondary)
-            }
-            HStack {
                 Text(TimeAgoFormatter.minutesAgo(from: unsure.date))
-                Text("Not reliable")
             }
             .font(.callout).fontWeight(.bold)
             .foregroundStyle(.orange)
@@ -345,6 +343,9 @@ struct CurrentGlucoseView: View {
     /// (no countdown — duration is sensor-driven); outside warmup/stabilizing
     /// the tag is gated to the same 48h window as the arc.
     private var tagLabel: (text: String, theme: SensorStatusTagTheme, icon: String?)? {
+        if unsureReading != nil {
+            return (String(localized: "Sensor issue: not reliable"), .orange, nil)
+        }
         if isInWarmup {
             let text: String
             if let endsAt = cgmWarmupEndsAt {

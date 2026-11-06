@@ -43,7 +43,7 @@ struct GlucoseTrendView: View {
     }
 
     private var glucoseColor: Color {
-        if unsureReading != nil { return Color.secondary }
+        if unsureReading != nil { return Color.orange }
         if let directReading {
             let glucose = Double(directReading.glucose)
             if glucose <= (reader.lowMgDL ?? 70) { return Color.loopRed }

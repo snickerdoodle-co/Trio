@@ -8,6 +8,38 @@ struct NightscoutStatus: JSON {
     let uploader: Uploader?
     /// The loop's own time; without it Nightscout stamps the status when it arrives.
     var created_at: Date? = nil
+    /// The Apple Watch's battery, when it reported one within the last hour (LoopFollow shows it; Nightscout and
+    /// other followers ignore the field).
+    var watchBattery: WatchBattery? = nil
+}
+
+/// The Apple Watch's battery as the watch last reported it.
+struct WatchBattery: JSON {
+    let battery: Int
+    let isCharging: Bool
+    let timestamp: Date
+
+    private static let key = "trio.watchBattery"
+    /// Older than this it is no longer worth showing.
+    static let maxAge: TimeInterval = 60 * 60
+
+    static func store(_ payload: [String: Any]) {
+        guard let percent = (payload["percent"] as? NSNumber)?.intValue,
+              let at = payload["date"] as? TimeInterval
+        else { return }
+        let charging = payload["charging"] as? Bool ?? false
+        UserDefaults.standard.set(["percent": percent, "charging": charging, "date": at], forKey: key)
+    }
+
+    static var latest: WatchBattery? {
+        guard let saved = UserDefaults.standard.dictionary(forKey: key),
+              let percent = (saved["percent"] as? NSNumber)?.intValue,
+              let at = saved["date"] as? TimeInterval
+        else { return nil }
+        let date = Date(timeIntervalSince1970: at)
+        guard Date().timeIntervalSince(date) < maxAge else { return nil }
+        return WatchBattery(battery: percent, isCharging: saved["charging"] as? Bool ?? false, timestamp: date)
+    }
 }
 
 struct OpenAPSStatus: JSON {

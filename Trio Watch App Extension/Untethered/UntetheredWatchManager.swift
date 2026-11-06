@@ -47,6 +47,8 @@ import WatchKit
     @ObservationIgnored var fallbackLooksPaused: (phoneNewest: Date, until: Date)?
     /// The phone's own newest reading, held until the watch's own reading of that cycle had its chance.
     @ObservationIgnored var pendingPhoneReading: SessionReading?
+    /// A loop that couldn't reach the pod: its reading and when it failed, to loop again once the pod link is back.
+    @ObservationIgnored var podRetryPending: (glucose: Date, failedAt: Date)?
     /// The session loops on the phone's readings: when the first was taken since the watch's own last one. Shown on
     /// the first page and the status page, and warned about after 20 minutes.
     var readingsFromPhoneSince: Date?
@@ -939,6 +941,8 @@ import WatchKit
 
     func recheckCGM() {
         watchCGMRecheckAcquisition(cgmManager)
+        // on a wake with the phone away, too: the phone takes it once it is back
+        WatchState.shared.reportBatteryIfChanged()
         takePendingPhoneReading()
         checkAlarms()
         checkPodLink()

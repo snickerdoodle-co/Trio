@@ -83,6 +83,8 @@ enum WatchMessageKeys {
     static let pumpName = "pumpName"
     static let pumpReservoir = "pumpReservoir"
     static let pumpBatteryPercent = "pumpBatteryPercent"
+    /// The watch's own battery (percent, charging, date), for the phone's device status upload.
+    static let watchBattery = "watchBattery"
     static let pumpExpiresAt = "pumpExpiresAt"
     static let pumpActivatedAt = "pumpActivatedAt"
     static let pumpStatusMessage = "pumpStatusMessage"

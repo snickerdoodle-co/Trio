@@ -721,7 +721,8 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
             pump: pump,
             uploader: uploader,
             // the loop's own time: a backlog uploaded newest first still leaves Nightscout on the newest loop
-            created_at: fetchedEnactedDetermination?.timestamp ?? modifiedSuggestedDetermination?.deliverAt
+            created_at: fetchedEnactedDetermination?.timestamp ?? modifiedSuggestedDetermination?.deliverAt,
+            watchBattery: WatchBattery.latest
         )
 
         do {

@@ -24,12 +24,10 @@ struct GlucoseChartView: ChartContent {
                 x: .value("Time", item.date, unit: .second),
                 y: .value("Value", units == .mgdL ? Decimal(item.mgdl) : Decimal(item.mgdl).asMmolL)
             )
+            // the stored readings' size and shape, only hollow
+            .foregroundStyle(Color.orange)
             .symbolSize(20)
-            .symbol {
-                Circle()
-                    .strokeBorder(Color.orange, lineWidth: 1.5)
-                    .frame(width: 7, height: 7)
-            }
+            .symbol(.circle.strokeBorder(lineWidth: 1.5))
         }
     }
 

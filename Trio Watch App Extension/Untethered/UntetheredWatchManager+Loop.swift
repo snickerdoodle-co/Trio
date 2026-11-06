@@ -18,6 +18,9 @@ enum UntetheredLoopTrigger {
     case treatment
     /// A dosing mode changed: determine and enact again with that mode's constraints on the current readings.
     case modeChanged
+    /// The pod link came back after this reading's loop failed to reach the pod: the same loop again, at once
+    /// rather than at the next reading.
+    case podBack
 }
 
 extension UntetheredWatchManager {
@@ -133,6 +136,7 @@ extension UntetheredWatchManager {
                         $0.lastLoopError = nil
                     }
                     self.podLinkRecovered(pump)
+                    self.podRetryPending = nil
                 }
                 if enacts {
                     do {
@@ -184,6 +188,10 @@ extension UntetheredWatchManager {
                 Task { await WatchLogger.shared.log("⌚️ Untethered loop failed: \(error)", force: true) }
                 // refused because the phone used the pod: it has the pump now
                 if self.yieldIfPhoneTookPod() { return }
+                // the pod out of reach: loop again as soon as its link is back, not only at the next reading
+                if enacts, String(describing: error).contains("podNotConnected") || String(describing: error).contains("commsError") {
+                    self.podRetryPending = (newestGlucose ?? .distantPast, Date())
+                }
             }
             if !self.loopHoldExpired, self.isActive {
                 await self.uploadToNightscout(forNightscout, grant: grant)
@@ -1313,6 +1321,9 @@ extension UntetheredWatchManager: PumpManagerDelegate {
             Task { await WatchLogger.shared.log(look ? "⌚️ Device (look): \(message)" : "⌚️ Device: \(message)", force: look) }
         }
         DispatchQueue.main.async { self.noteSensorPairingEvent(message) }
+        if message.hasPrefix("Pod connected"), isSessionPump(manager as AnyObject) {
+            DispatchQueue.main.async { self.loopAgainIfPodBack() }
+        }
         // ponytail: matched on G7SensorKit's log line, which is the only place it reports a link error;
         // move to a delegate call if the kit ever reports one. 14 = the peer removed the pairing: the sensor no
         // longer has this watch's bond. 15 = encryption timed out, which a weak link does too: only twice in a row,
@@ -2592,5 +2603,35 @@ enum ActionNotice {
             guard !ids.isEmpty else { return }
             center.removePendingNotificationRequests(withIdentifiers: ids)
         }
+    }
+}
+
+extension UntetheredWatchManager {
+    /// A failed loop's reading stays worth looping on until the next one is due.
+    static let podRetryWindow: TimeInterval = 4.5 * 60
+
+    /// The pod link came back after a loop failed to reach the pod: loop again on that reading now (5 November,
+    /// 22:32: the pod was reached again 4 min after the failed loop, and the watch waited for the next reading;
+    /// asked for by the first tester).
+    func loopAgainIfPodBack(now: Date = Date()) {
+        guard let pending = podRetryPending else { return }
+        let newestGlucose = data.glucose.map(\.dateString).max() ?? .distantPast
+        // too late, or a newer reading loops anyway
+        guard now.timeIntervalSince(pending.failedAt) < Self.podRetryWindow, newestGlucose <= pending.glucose,
+              isActive, !isLooping, !isBolusing
+        else {
+            if now.timeIntervalSince(pending.failedAt) >= Self.podRetryWindow || newestGlucose > pending.glucose {
+                podRetryPending = nil
+            }
+            return
+        }
+        podRetryPending = nil
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: the pod is back, looping again on the reading from \(pending.glucose.formatted(date: .omitted, time: .shortened))",
+                force: true
+            )
+        }
+        runLoop(.podBack)
     }
 }

@@ -147,6 +147,20 @@ struct ChartLegendView: View {
                             )
 
                             DefinitionRow(
+                                term: String(localized: "Unreliable Sensor Reading"),
+                                definition: VStack(alignment: .leading, spacing: 10) {
+                                    Text(
+                                        "A value the G7 sent during a sensor issue, marked by the sensor itself as unreliable. Shown as a rough guide only."
+                                    )
+                                    Text(
+                                        "It is never used for dosing, alarms or statistics, and is not stored as a glucose reading."
+                                    )
+                                },
+                                color: Color.orange,
+                                iconString: "circle"
+                            )
+
+                            DefinitionRow(
                                 term: String(localized: "Bolus"),
                                 definition: Text(
                                     "Shows an insulin dose, which can be a small automated dose (super-micro-bolus), a manually entered dose, or one given externally (e.g., a pen shot)."
