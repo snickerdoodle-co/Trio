@@ -52,41 +52,24 @@ final class PluginSource: GlucoseSource {
         cgmProgressHighlight.value = cgmManager?.cgmLifecycleProgress
     }
 
-    /// Function that fetches blood glucose data
-    /// This function combines two data fetching mechanisms (`callBLEFetch` and `fetchIfNeeded`) into a single publisher.
-    /// It returns the first non-empty result from either of the sources within a 5-minute timeout period.
-    /// If no valid data is fetched within the timeout, it returns an empty array.
+    /// The glucose timer's nudge: asks the CGM manager for new data when some is due. The readings reach Trio through
+    /// the delegate (`cgmManager(_:hasNew:)`), never through this publisher, which finishes empty.
     ///
-    /// - Parameter timer: An optional `DispatchTimer` (not used in the function but can be used to trigger fetch logic).
-    /// - Returns: An `AnyPublisher` that emits an array of `BloodGlucose` values or an empty array if an error occurs or the timeout is reached.
+    /// Before, a `Future` answered with an empty list that a filter then dropped, and a 5-minute timeout ended it with
+    /// another empty list: nothing ever came through it. The filter's check of that list crashed the app once
+    /// (6 November, build 134: EXC_BAD_ACCESS in `PluginSource.fetch`, `!$0.isEmpty`, on the glucose manager's queue,
+    /// with the answer delivered from the CGM manager's).
     func fetch(_: DispatchTimer?) -> AnyPublisher<[BloodGlucose], Never> {
         fetchIfNeeded()
-            .filter { !$0.isEmpty }
-            .first()
-            .timeout(60 * 5, scheduler: processQueue, options: nil, customError: nil)
-            .replaceError(with: [])
-            .eraseToAnyPublisher()
     }
 
     func fetchIfNeeded() -> AnyPublisher<[BloodGlucose], Never> {
-        Future<[BloodGlucose], Error> { [weak self] promise in
-            guard let self = self else { return }
-            self.processQueue.async {
-                guard let cgmManager = self.cgmManager else { return }
-                cgmManager.fetchNewDataIfNeeded { _ in
-                    // Ignore values returned from fetchNewDataIfNeeded since
-                    // these come from share client and cause a race condition
-                    // that causes the promise to complete before a CGM value
-                    // has a chance to return. From looking at the code this should
-                    // only impact G6 since that is the only CGM manager that will
-                    // return data and only if share credentials are set
-                    promise(.success([]))
-                }
-            }
+        processQueue.async { [weak self] in
+            // what it returns is left out on purpose: it comes from the Share client and would race the CGM's own
+            // reading (G6 with Share credentials only)
+            self?.cgmManager?.fetchNewDataIfNeeded { _ in }
         }
-        .replaceError(with: [])
-        .replaceEmpty(with: [])
-        .eraseToAnyPublisher()
+        return Empty().eraseToAnyPublisher()
     }
 
     deinit {
@@ -164,7 +147,8 @@ extension PluginSource: CGMManagerDelegate {
             case let .failure(error):
                 debug(.cgm, "CGM reading not usable: \(error.localizedDescription)")
                 // the G7 sent a value it marks unreliable: shown greyed, never used
-                if let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
+                if UnsureGlucoseStore.isEnabled,
+                   let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
                    let glucose = message.glucose, let date = g7.latestReadingTimestamp
                 {
                     UnsureGlucoseStore.shared.add(UnsureGlucose(date: date, mgdl: Int(glucose)))
@@ -394,7 +378,24 @@ final class UnsureGlucoseStore: ObservableObject {
 
     private static let storageKey = "trio.unsureGlucose"
 
+    /// "Show Unreliable G7 Readings" on the CGM page; off unless turned on. Off, none are kept, shown or uploaded,
+    /// and the watch, told with every state update, shows none of its own either.
+    static let enabledKey = "trio.showUnreliableG7"
+    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+
+    /// Turning it off drops what is kept; either way the empty set tells the watch at once.
+    func setEnabled(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Self.enabledKey)
+        DispatchQueue.main.async { self.readings = [] }
+    }
+
     init() {
+        // a new sensor's readings count from after the old one's last, an unreliable one included
+        CGMSensorHandover.latestOtherReading = { UnsureGlucoseStore.shared.latest?.date }
+        guard Self.isEnabled else {
+            UserDefaults.standard.removeObject(forKey: Self.storageKey)
+            return
+        }
         if let data = UserDefaults.standard.data(forKey: Self.storageKey),
            let saved = try? JSONDecoder().decode([UnsureGlucose].self, from: data)
         {
@@ -414,6 +415,7 @@ final class UnsureGlucoseStore: ObservableObject {
     }
 
     func add(_ reading: UnsureGlucose) {
+        guard Self.isEnabled else { return }
         DispatchQueue.main.async {
             guard !self.readings.contains(where: { abs($0.date.timeIntervalSince(reading.date)) < 60 }) else { return }
             let now = Date()

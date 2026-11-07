@@ -69,9 +69,9 @@ struct UntetheredStatusView: View {
                     }
                     if manager.isActive { tiles }
                     if manager.isActive {
-                        // remote commands come through the phone's push: without it online they wait or run out
+                        // remote commands come through the phone, or as LoopFollow's copy pushed straight to the watch
                         note(
-                            "Remote boluses and meals (LoopFollow, Nightscout) reach the watch only through the iPhone, while it is online. The watch refuses commands sent more than 10 minutes ago."
+                            "Remote boluses and meals reach the watch through the iPhone while it is online, or straight from LoopFollow when it sends to the watch. The watch refuses commands sent more than 10 minutes ago."
                         )
                     }
                     if manager.isActive || unsynced > 0 { historyButton }
@@ -951,18 +951,7 @@ struct UntetheredGlanceView: View {
         newestReading.map { now.timeIntervalSince($0) > 6 * 60 } ?? true
     }
 
-    private var arrow: String {
-        switch state.trend {
-        case "DoubleUp": return "⇈"
-        case "SingleUp": return "↑"
-        case "FortyFiveUp": return "↗"
-        case "Flat": return "→"
-        case "FortyFiveDown": return "↘"
-        case "SingleDown": return "↓"
-        case "DoubleDown": return "⇊"
-        default: return ""
-        }
-    }
+    private var arrow: String { WatchG7Reader.shared.arrow(for: state.trend) }
 
     private func glucose(size: CGFloat, now: Date) -> some View {
         let stale = isStale(now)
@@ -1048,7 +1037,9 @@ struct UntetheredGlanceView: View {
                 Text(manager.heartRate.map { "\(Int($0.rounded()))" } ?? "--")
             }
         case .reservoir:
-            Text(data.reservoir.map { "\(number($0, places: 0)) U" } ?? "50+ U")
+            // "50+ U" only for the pod's above-50 marker, as the Reservoir tile; unknown is "--"
+            Text(data.reservoir.map { "\(number($0, places: 0)) U" }
+                ?? (data.grant?.reservoir == Decimal(UInt32(0xDEAD_BEEF)) ? "50+ U" : "--"))
         case .lastReading:
             Text(newestReading.map { "\(minutes(since: $0, now: now))m" } ?? "--")
         case .totalDailyDose:

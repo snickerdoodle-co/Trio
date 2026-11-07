@@ -49,6 +49,8 @@ import WatchKit
     @ObservationIgnored var pendingPhoneReading: SessionReading?
     /// A loop that couldn't reach the pod: its reading and when it failed, to loop again once the pod link is back.
     @ObservationIgnored var podRetryPending: (glucose: Date, failedAt: Date)?
+    /// The meal-time reminder set with the bolus being delivered, until its estimated end: a cancel counts it from then.
+    @ObservationIgnored var pendingMealReminder: (minutes: Int, deliveredBy: Date)?
     /// The session loops on the phone's readings: when the first was taken since the watch's own last one. Shown on
     /// the first page and the status page, and warned about after 20 minutes.
     var readingsFromPhoneSince: Date?
@@ -530,11 +532,8 @@ import WatchKit
                 if let replyHandler = reply {
                     self.reply(message, epoch: epoch, via: replyHandler)
                     reply = nil
-                } else if case .statusReport = message {
-                    // the answer to the phone's ownership question: the phone doesn't dose until it has it, so it is
-                    // queued too when the phone can't be reached this moment (the phone ignores it once it decided)
-                    send(message, epoch: epoch, queueing: true)
                 } else {
+                    // `.statusReport`, the answer to the phone's ownership question, is queued by `send` itself
                     send(message, epoch: epoch)
                 }
             case .takeover:
@@ -653,8 +652,12 @@ import WatchKit
         // what must reach the phone even if it is away right now; the rest is resent by its own retry
         let queued: Bool
         switch message {
+        // the answer to the phone's ownership question too: the phone holds its dosing until it comes (6 November,
+        // 07:36: the question woke the watch, the phone was out of reach for that second, the answer was dropped, and
+        // the phone held its dosing for 7 minutes with "Checking with the Watch", a loop with it)
         case .records,
              .released,
+             .statusReport,
              .syncDone,
              .takeoverComplete,
              .takeoverFailed: queued = queueing ?? true
@@ -735,21 +738,7 @@ import WatchKit
         install(pump)
         // the phone's sessions before the hand-over are expected; only one after the watch has the pod counts
         pump.refusesForeignSessionsSince = nil
-        pump.takeControl()
-        isBusy = true
-        let epoch = data.session.epoch
-        Task { @MainActor in
-            defer { self.isBusy = false }
-            while self.data.session.phase == .starting, self.data.session.epoch == epoch {
-                if let status = await self.readPump(pump) {
-                    // the phone's last loop stays on screen; the next CGM reading starts the watch's own
-                    self.apply(.takeoverSucceeded(self.startStatus(status, pump: pump)))
-                    return
-                }
-                try? await Task.sleep(nanoseconds: Self.takeoverReadInterval)
-                // a later tick past the lease releases the pump
-            }
-        }
+        takeover(continuing: pump, showsBusy: true)
     }
 
     /// A bolus ends by the clock: the pump reports no change when it runs out, so the end is checked
@@ -766,6 +755,28 @@ import WatchKit
             guard let self else { return }
             self.updateBolusState(self.pumpManager?.status)
             self.refresh()
+        }
+    }
+
+    /// The meal-time reminder while the watch has the pump: the phone may be away, so the watch rings itself, the
+    /// set minutes after the bolus has been delivered (a pod gives about 1.5 U a minute) or from now without one.
+    func remindToEat(after minutes: Int, bolus units: Decimal) {
+        let delivery = Double(truncating: units as NSNumber) / 1.5 * 60
+        let deliveredAt = bolusWindow.map { max($0.end, Date()) } ?? Date().addingTimeInterval(delivery)
+        let delay = deliveredAt.timeIntervalSinceNow + Double(minutes * 60)
+        pendingMealReminder = units > 0 ? (minutes, deliveredAt) : nil
+        notify(
+            id: Self.notificationPrefix + "mealTimeReminder",
+            title: String(localized: "Time to Eat", comment: "Meal-time reminder on the watch"),
+            body: String(localized: "Your \(minutes) min meal-time reminder is up: time to eat.", comment: "Meal-time reminder on the watch"),
+            after: max(1, delay),
+            asksForAction: true
+        )
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: meal-time reminder in \(Int((delay / 60).rounded())) min (\(minutes) min after the bolus)",
+                force: true
+            )
         }
     }
 
@@ -799,7 +810,12 @@ import WatchKit
         // the next session's stall asks the phone afresh
         handbackRequestedAt = nil
         lastPodLinkNotice = nil
+        lastPodLinkReset = nil
         podLinkNoticeCount = 0
+        // the pump is back: "Watch Took Over" isn't asked again (`ActionNotice`)
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: ActionNotice.reminderDelays.indices.map { Self.tookOverID + ".again\($0 + 1)" }
+        )
         if let pump = pumpManager {
             pump.releaseControl()
             savePumpState()
@@ -893,9 +909,9 @@ import WatchKit
         cgm.delegateQueue = .main
         cgmManager = cgm
         saveCGMState()
-        // a CGM set up with Trio in front holds in the app from the start (see watchCGMAppBecameActive)
+        // a CGM set up with Trio in front checks its acquisition at once, as on every wake
         DispatchQueue.main.async {
-            if WKApplication.shared().applicationState == .active { watchCGMAppBecameActive(cgm) }
+            if WKApplication.shared().applicationState == .active { watchCGMRecheckAcquisition(cgm) }
         }
     }
 
@@ -925,7 +941,6 @@ import WatchKit
     /// 20 October that froze the sensor's next connect before it was made: nothing woke the app for over 30 minutes.
     func appLeavingScreen() {
         guard isActive else { return }
-        watchCGMAppLeavingScreen(cgmManager)
         scheduleSessionRefresh()
     }
 
@@ -965,12 +980,18 @@ import WatchKit
         }
     }
 
-    private func takeover(continuing pump: PumpManager & ExclusiveDeviceControl) {
+    /// Reads the pod until the session's start succeeds; a later tick past the lease releases the pump.
+    private func takeover(continuing pump: PumpManager & ExclusiveDeviceControl, showsBusy: Bool = false) {
         pump.takeControl()
         let epoch = data.session.epoch
+        if showsBusy { isBusy = true }
         Task { @MainActor in
+            defer { if showsBusy { self.isBusy = false } }
             while self.data.session.phase == .starting, self.data.session.epoch == epoch {
                 if let status = await self.readPump(pump) {
+                    // a read that outlasted its try (the lease ran out, a newer try began) doesn't start the next one
+                    guard self.data.session.phase == .starting, self.data.session.epoch == epoch else { return }
+                    // the phone's last loop stays on screen; the next CGM reading starts the watch's own
                     self.apply(.takeoverSucceeded(self.startStatus(status, pump: pump)))
                     return
                 }
@@ -1762,8 +1783,7 @@ extension UntetheredWatchManager {
             loggedFallbackSetting = fallbackOn
             Task { await WatchLogger.shared.log("⌚️ Untethered: Start by Itself is \(fallbackOn ? "on" : "off")", force: true) }
         }
-        guard state.fallbackLoop, state.untetheredMode, state.allowUntetheredStartWithoutPhone,
-              data.session.phase == .idle, !isBusy, !WCSession.default.isReachable,
+        guard fallbackOn, data.session.phase == .idle, !isBusy, !WCSession.default.isReachable,
               versionMismatch == nil, standingGrantAge != nil
         else { return }
         // The phone's newest reading, not any contact: on 22 October at 17:05 the phone, Bluetooth off in a metal
@@ -2094,13 +2114,16 @@ extension UntetheredWatchManager {
         }
         UserDefaults.standard.set(data.session.epoch, forKey: Self.fallbackEpochKey)
         guard attempt == 1 else { return }
-        // not "took over" yet: that comes when the pod answered (`fallbackTookOver`)
+        // not "took over" yet: that comes when the pod answered (`fallbackTookOver`), usually within seconds, and
+        // cancels this one before it shows. Only a takeover that takes longer says so first (7 November: both came
+        // within 4 s, one tap, and neither was seen).
         notify(
             id: Self.notificationPrefix + "fallback",
             title: String(localized: "iPhone Out of Reach"),
             body: String(
                 localized: "The iPhone has been silent for \(minutes) minutes. The watch is trying to take over the pump and tells you when it has."
-            )
+            ),
+            after: 60
         )
     }
 
@@ -2122,18 +2145,22 @@ extension UntetheredWatchManager {
                 localized: "The iPhone has been silent for \($0) minutes and is out of reach. The watch runs the pump until it's back, then hands it back by itself."
             )
         } ?? String(localized: "The watch runs the pump until the iPhone is back, then hands it back by itself.")
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.notificationPrefix + "fallback"])
         // watchOS starts Extended Untethered Mode's workout only with Trio in front
         let opensForWorkout = WatchState.shared.untetheredWorkout && WKApplication.shared().applicationState != .active
-        // with the workout to start the user has something to do: said in the title, felt and asked again
+        // who doses changed: felt twice and asked again at 2 and 5 minutes until Trio is opened (7 November: a single
+        // tap, and the notice wasn't seen); with the workout to start, the title says so too
         notify(
-            id: Self.notificationPrefix + "fallback",
+            id: Self.tookOverID,
             title: opensForWorkout ? String(localized: "Watch Took Over: Open Trio") : String(localized: "Watch Took Over"),
             body: opensForWorkout
                 ? body + " " + String(localized: "Open Trio on the watch once, so it starts the workout that keeps it awake.")
                 : body,
-            asksForAction: opensForWorkout
+            asksForAction: WKApplication.shared().applicationState != .active
         )
     }
+
+    static let tookOverID = notificationPrefix + "tookOver"
 
     /// A try's time ran out without the pod: the next reading tries again, the last one says so.
     private func fallbackTryFailed() {

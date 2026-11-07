@@ -68,6 +68,40 @@ import WatchKit
     var bolusIncrement: Decimal = 0.05
     var confirmBolusFaster: Bool = false
 
+    /// The phone's Enable Reduced Bolus Option / Enable Super Bolus Option, as it last sent them.
+    var reducedBolusOption = false
+    var superBolusOption = false
+
+    /// Whether the bolus page offers a reduced or a super bolus: while the watch has the pump from the copy it took,
+    /// else from the phone's last state.
+    var offersReducedBolus: Bool {
+        if UntetheredWatchManager.shared.isActive {
+            return UntetheredWatchManager.shared.data.grant?.bolusCalculator.fattyMeals ?? false
+        }
+        return reducedBolusOption
+    }
+
+    /// Settings › Bolus Calculator › Meal-Time Reminder and its presets, as the phone last sent them; kept, so the
+    /// watch offers them while the phone is away too.
+    var mealTimeReminderEnabled: Bool = UserDefaults.standard.bool(forKey: WatchMessageKeys.mealTimeReminderEnabled) {
+        didSet { UserDefaults.standard.set(mealTimeReminderEnabled, forKey: WatchMessageKeys.mealTimeReminderEnabled) }
+    }
+
+    var mealTimeReminderPresets: [Int] = UserDefaults.standard.array(forKey: WatchMessageKeys.mealTimeReminderPresets) as? [Int]
+        ?? [] {
+        didSet { UserDefaults.standard.set(mealTimeReminderPresets, forKey: WatchMessageKeys.mealTimeReminderPresets) }
+    }
+
+    /// This meal's reminder on the bolus page, in minutes; 0 is off. Off each time the page opens, as on the phone.
+    var mealTimeReminderMinutes = 0
+
+    var offersSuperBolus: Bool {
+        if UntetheredWatchManager.shared.isActive {
+            return UntetheredWatchManager.shared.data.grant?.bolusCalculator.sweetMeals ?? false
+        }
+        return superBolusOption
+    }
+
     /// Settings › Apple Watch › Untethered Mode, as the phone last sent it; kept, so it holds while the phone is away.
     /// On until the phone says otherwise.
     var untetheredMode: Bool = UserDefaults.standard.object(forKey: WatchMessageKeys.untetheredModeWatch) as? Bool ?? true {
@@ -157,9 +191,21 @@ import WatchKit
     var unsureGlucoseMgdl: Int?
     var unsureGlucoseDate: Date?
 
+    /// The phone's "Show Unreliable G7 Readings"; kept, so the watch's own reader and untethered mode follow it
+    /// while the phone is away. Off unless the phone said otherwise.
+    var showsUnreliableG7 = UserDefaults.standard.bool(forKey: WatchMessageKeys.showUnreliableG7) {
+        didSet {
+            UserDefaults.standard.set(showsUnreliableG7, forKey: WatchMessageKeys.showUnreliableG7)
+            if !showsUnreliableG7 {
+                unsureGlucoseMgdl = nil
+                unsureGlucoseDate = nil
+            }
+        }
+    }
+
     func noteUnsureGlucose(mgdl: Int, date: Date) {
         DispatchQueue.main.async {
-            guard date > (self.unsureGlucoseDate ?? .distantPast) else { return }
+            guard self.showsUnreliableG7, date > (self.unsureGlucoseDate ?? .distantPast) else { return }
             self.unsureGlucoseMgdl = mgdl
             self.unsureGlucoseDate = date
         }
@@ -636,6 +682,9 @@ import WatchKit
             .sorted { $0.date < $1.date }
         }
 
+        if let show = message[WatchMessageKeys.showUnreliableG7] as? Bool, show != showsUnreliableG7 {
+            showsUnreliableG7 = show
+        }
         if let at = message[WatchMessageKeys.unsureGlucoseDate] as? TimeInterval,
            let mgdl = (message[WatchMessageKeys.unsureGlucoseMgdl] as? NSNumber)?.intValue
         {
@@ -705,6 +754,20 @@ import WatchKit
                 // limit minimum to 0.05 to avoid dealing with 0.025 increments
                 self.bolusIncrement = max(decimalValue, 0.05)
             }
+        }
+
+        if let reminder = message[WatchMessageKeys.mealTimeReminderEnabled] as? Bool, reminder != mealTimeReminderEnabled {
+            mealTimeReminderEnabled = reminder
+        }
+        if let presets = message[WatchMessageKeys.mealTimeReminderPresets] as? [Int], presets != mealTimeReminderPresets {
+            mealTimeReminderPresets = presets
+        }
+
+        if let reduced = message[WatchMessageKeys.reducedBolusOption] as? Bool {
+            reducedBolusOption = reduced
+        }
+        if let superBolus = message[WatchMessageKeys.superBolusOption] as? Bool {
+            superBolusOption = superBolus
         }
 
         if let confirmBolusFaster = message[WatchMessageKeys.confirmBolusFaster] {

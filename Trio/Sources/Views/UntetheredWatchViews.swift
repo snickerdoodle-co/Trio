@@ -139,7 +139,7 @@ struct UntetheredBannerSlot<Content: View, Banner: View>: View {
                     : manager.state.pumpReturnPending
                     ? manager.pumpReturnTitle
                     : manager.isHandingBack ? String(localized: "Asking the watch for the pump…")
-                    : manager.state.session.isCheckingForeignSession ? String(localized: "Checking with the Watch…")
+                    : manager.state.session.isCheckingForeignSession ? String(localized: "Safety Check with the Watch")
                     : String(localized: "Untethered on Apple Watch"),
                 manager.isBluetoothOff
                     ? (manager.state.pumpReturnPending
@@ -151,7 +151,8 @@ struct UntetheredBannerSlot<Content: View, Banner: View>: View {
                     : manager.isHandingBack
                     ? String(localized: "Open Trio on the watch to finish now. Otherwise it can take a few minutes, until the watch picks up the request.")
                     : manager.state.session.isCheckingForeignSession
-                    ? String(localized: "Another controller used the pod. Dosing waits until the watch says whether it has the pump, at most 3 minutes; opening Trio on the watch answers at once.")
+                    // not untethered mode, though it shows in its place (6 November, 07:36: "what was that?")
+                    ? String(localized: "The watch was just at the pod. The phone waits for the watch's answer before dosing again, usually a few seconds. Untethered mode is not on.")
                     : String(localized: "The phone doesn't dose. Bolus and carbs are entered on the watch."),
                 manager.isWatchInCharge,
                 { showActions = manager.isWatchInCharge }
@@ -281,7 +282,7 @@ struct UntetheredTreatmentGate<Content: View>: View {
                     Text(
                         manager.state.pumpReturnPending ? manager
                             .pumpReturnTitle
-                            : manager.state.session.isCheckingForeignSession ? String(localized: "Checking with the Watch")
+                            : manager.state.session.isCheckingForeignSession ? String(localized: "Safety Check with the Watch")
                             : String(localized: "The Apple Watch is looping")
                     )
                     .font(.title3).fontWeight(.semibold)
@@ -292,7 +293,7 @@ struct UntetheredTreatmentGate<Content: View>: View {
                             : String(localized: "The phone doses again once it has read the pump.")
                             : manager.state.session.isCheckingForeignSession
                             ? String(
-                                localized: "Another controller used the pod. Boluses wait until the watch says whether it has the pump, at most 3 minutes; opening Trio on the watch answers at once."
+                                localized: "The watch was just at the pod. Boluses wait for the watch's answer, usually a few seconds. Untethered mode is not on."
                             )
                             :
                             String(
@@ -368,6 +369,19 @@ struct UntetheredTreatmentGate<Content: View>: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// The home screen's background while the watch has the pump: a wash of the untethered color over Trio's own.
+struct UntetheredHomeTint: View {
+    @ObservedObject var manager: UntetheredPhoneManager
+
+    var body: some View {
+        Color.untethered
+            .opacity(manager.tintsHomeScreen ? 0.16 : 0)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .animation(.easeInOut(duration: 0.4), value: manager.tintsHomeScreen)
     }
 }
 

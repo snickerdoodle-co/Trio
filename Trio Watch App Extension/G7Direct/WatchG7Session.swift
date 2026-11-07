@@ -54,11 +54,6 @@ final class WatchG7Session: G7BluetoothManagerDelegate {
     /// Readings older than this after a gap are not asked for.
     private static let maximumBackfillWindow = TimeInterval(hours: 6)
 
-    var credentials: WatchG7Credentials {
-        lockedCredentials.value
-    }
-
-    var needsCodeForSensor: String? { bluetoothManager.needsCodeForSensor }
     var isSearchingForSensor: Bool { bluetoothManager.isSearchingForSensor }
 
     init(credentials: WatchG7Credentials, latestReadingDate: Date?) {

@@ -8,6 +8,7 @@ enum MultiUsePanelState: Equatable {
     /// What the pump delivered in an untethered session and what the complete history says still differ.
     case untetheredAudit(String)
     case maxIOBZero
+    case mealTimeReminderCountdown(PendingMealTimeReminder)
     case whatsNew
     case dosingModeLimited(DosingMode)
     case stats
@@ -20,6 +21,7 @@ enum MultiUsePanelState: Equatable {
         pumpTimeMismatch: Bool,
         lastGlucoseDate: Date?,
         maxIOB: Decimal,
+        pendingMealTimeReminder: PendingMealTimeReminder?,
         hasUnacknowledgedReleaseNotes: Bool,
         dosingMode: DosingMode,
         untetheredAuditFinding: String? = nil,
@@ -28,6 +30,9 @@ enum MultiUsePanelState: Equatable {
         if notificationsDisabled { return .notificationsDisabled }
         if pumpTimeMismatch { return .pumpTimeMismatch }
         if now.timeIntervalSince(lastGlucoseDate ?? .distantPast) > cgmStaleAfter { return .cgmStale }
+        // A pending meal-time reminder is time-sensitive, so it outranks the deliberate, persistent states
+        // below but still yields to the "something is broken right now" warnings above.
+        if let pendingMealTimeReminder { return .mealTimeReminderCountdown(pendingMealTimeReminder) }
         // insulin on board may be off: ahead of the standing settings below, which would hide it for good
         if let untetheredAuditFinding { return .untetheredAudit(untetheredAuditFinding) }
         // constrained modes clamp Max IOB to 0 without touching the stored value

@@ -344,7 +344,8 @@ struct CurrentGlucoseView: View {
     /// the tag is gated to the same 48h window as the arc.
     private var tagLabel: (text: String, theme: SensorStatusTagTheme, icon: String?)? {
         if unsureReading != nil {
-            return (String(localized: "Sensor issue: not reliable"), .orange, nil)
+            // two lines: on one it was cut to "Sensor issue: not …" (first tester, 6 November)
+            return (String(localized: "Sensor issue:\nnot reliable"), .orange, nil)
         }
         if isInWarmup {
             let text: String

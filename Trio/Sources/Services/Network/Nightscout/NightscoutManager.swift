@@ -1434,7 +1434,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
     /// value, so an entry would show as a real reading in every LoopFollow; an unknown treatment type it skips.
     /// Never in Nightscout's glucose, statistics or anything Trio downloads.
     private func uploadUnsureGlucose(_ readings: [UnsureGlucose]) async {
-        guard isUploadEnabled, isUploadGlucoseEnabled else { return }
+        guard isUploadEnabled, isUploadGlucoseEnabled, UnsureGlucoseStore.isEnabled else { return }
         let uploadedUntil = UserDefaults.standard.object(forKey: Self.unsureUploadedKey) as? Date ?? .distantPast
         let pending = readings.filter { $0.date > uploadedUntil }
         guard let newest = pending.last?.date else { return }
