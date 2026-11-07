@@ -41,7 +41,6 @@ import WatchKit
     private(set) var isStandingAside = false
     /// Back from untethered mode, until the first reading arrives.
     private(set) var isReconnecting = false
-    private(set) var needsCodeForSensor: String? = nil
     /// The sensor's state when it last answered without a usable reading (warm-up, failed, ...).
     private(set) var sensorProblem: String? = nil
     /// The same as a few words for the first page, so a missing reading is put down to the sensor, not the watch.
@@ -301,6 +300,15 @@ import WatchKit
     func appBecameActive() {
         ActionNotice.clearReminders()
         session?.appBecameActive()
+        // a pairing is due: Trio stays in front until the first reading. Opened from a notification, Trio may count
+        // as in front only a moment later, so asked again once it has settled.
+        if isPairingDue {
+            keepInFrontForPairing()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.isPairingDue else { return }
+                self.keepInFrontForPairing()
+            }
+        }
     }
 
     func appLeavingScreen() {
@@ -471,6 +479,7 @@ import WatchKit
         setSharedKey(nil)
         setPeripheralIdentifier(nil)
         session?.update(credentials: credentials)
+        pairingBecameDue()
     }
 
     private var credentials: WatchG7Credentials {
@@ -565,10 +574,13 @@ import WatchKit
 
         let code = (payload[WatchMessageKeys.g7DirectPairingCode] as? String).flatMap { $0.isEmpty ? nil : $0 }
         var credentialsChanged = false
+        var newSensorArrived = false
 
         if name.suffix(2) != sensorName?.suffix(2) {
             if sensorName != nil {
                 appendLog("New sensor \(name) from the iPhone")
+                lastPairingAsk = nil
+                newSensorArrived = true
             }
             sensorName = name
             defaults.set(name, forKey: Key.sensorName)
@@ -584,6 +596,8 @@ import WatchKit
                 // A new code means a new sensor, even if its name ends the same.
                 setSharedKey(nil)
                 setPeripheralIdentifier(nil)
+                lastPairingAsk = nil
+                newSensorArrived = true
             }
             pairingCode = code
             defaults.set(code, forKey: Key.pairingCode)
@@ -593,6 +607,7 @@ import WatchKit
         if credentialsChanged {
             startSessionIfPossible()
         }
+        if newSensorArrived { pairingBecameDue() }
     }
 
     // MARK: - Background Bluetooth wakes
@@ -761,11 +776,13 @@ import WatchKit
 
     private func sensorStateRecovered() {
         temporaryIssueCount = 0
-        guard sensorProblemLabel != nil else { return }
-        sensorProblemLabel = nil
+        // before the guard: the label doesn't survive a relaunch, the flags do, and a flag left from a failed sensor
+        // would keep the next sensor's failure or end silent
         for alert in [SensorAlert.failed, .ended, .issue] {
             defaults.removeObject(forKey: Key.lastAlert + alert.rawValue)
         }
+        guard sensorProblemLabel != nil else { return }
+        sensorProblemLabel = nil
         UNUserNotificationCenter.current().removeDeliveredNotifications(
             withIdentifiers: [SensorAlert.issue].map { Self.notificationIdentifierPrefix + $0.rawValue }
         )
@@ -964,6 +981,8 @@ import WatchKit
     func sessionDidInvalidateSharedKey(_: WatchG7Session) {
         DispatchQueue.main.async {
             self.setSharedKey(nil)
+            // the next connection pairs again: asked for now, not only once the system's prompt appears
+            self.pairingBecameDue()
         }
     }
 
@@ -992,12 +1011,16 @@ import WatchKit
     private func notePairingStep(_ line: String) {
         if line.contains("Running the certificate exchange")
             || line.contains("Pairing: running the key exchange")
-            || line.contains("the sensor no longer accepts the saved key")
         {
             keepInFrontForPairing()
         } else if line.contains("expect the system pairing prompt") {
-            WKInterfaceDevice.current().play(.notification)
-            if WKApplication.shared().applicationState != .active { askToOpenForPairing() }
+            // the wrist feels the request coming only when it can show: behind the watch face the notice buzzes
+            // instead (6 November, 19:16: a haptic with only the watch face to see)
+            if WKApplication.shared().applicationState == .active {
+                WKInterfaceDevice.current().play(.notification)
+            } else {
+                askToOpenForPairing()
+            }
         } else if line.hasPrefix("Bonded") || line.hasPrefix("Already authenticated and bonded") || line.hasPrefix("Reading ") {
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.pairingNotificationID])
             guard let keepAlive = pairingKeepAlive else { return }
@@ -1013,14 +1036,18 @@ import WatchKit
     /// The system's Bluetooth pairing request only shows with Trio in front. In the background a new sensor's
     /// pairing went round in circles for an hour (29 October, second tester: paired at 15:38, 15:48, 16:13, 16:23 and
     /// refused each time at the next reading) until Trio was opened at 16:33 and the bond went through at once.
-    private func askToOpenForPairing() {
+    private func askToOpenForPairing(early: Bool = false) {
         guard (lastPairingAsk ?? .distantPast).addingTimeInterval(20 * 60) < Date() else { return }
         lastPairingAsk = Date()
         let content = UNMutableNotificationContent()
         content.title = String(localized: "Open Trio to Pair the Sensor")
-        content.body = String(
-            localized: "The watch needs Trio on the screen to finish pairing the new sensor. Open Trio on the watch and keep it in front until the first reading shows."
-        )
+        content.body = early
+            ? String(
+                localized: "Open Trio on the watch now and keep it open until the first reading shows. The sensor pairs within about 5 minutes; accept the Bluetooth pairing request when it appears."
+            )
+            : String(
+                localized: "The watch needs Trio on the screen to finish pairing the new sensor. Open Trio on the watch and keep it in front until the first reading shows."
+            )
         content.sound = .default
         // it asks for action: through Focus, as the untethered notices that ask for something (`ActionNotice`)
         content.interruptionLevel = .timeSensitive
@@ -1031,6 +1058,24 @@ import WatchKit
         ))
         ActionNotice.ask(id: Self.pairingNotificationID, content: content)
         appendLog("Pairing: asked to open Trio on the watch")
+    }
+
+    /// The watch has no key for the sensor while it reads it itself: the next connection pairs.
+    private var isPairingDue: Bool {
+        isEnabled && !isStandingAside && !hasWatchKey && sensorName != nil
+    }
+
+    /// A new sensor or a pairing reset. The sensor connects within its 5-minute cycle, and the system's pairing
+    /// request then shows only with Trio in front; asking at the request itself is too late (6 November, 19:11:
+    /// new sensor from the iPhone, the pairing ran behind the watch face at 19:15:53, and the sensor dropped the
+    /// link in the second the notice came at 19:16:05). So Trio asks now, and stays in front once opened.
+    private func pairingBecameDue() {
+        guard isPairingDue else { return }
+        if WKApplication.shared().applicationState == .active {
+            keepInFrontForPairing()
+        } else {
+            askToOpenForPairing(early: true)
+        }
     }
 
     private func keepInFrontForPairing() {
@@ -1052,11 +1097,7 @@ import WatchKit
 
     func sessionStatusDidChange(_ session: WatchG7Session) {
         let searching = session.isSearchingForSensor
-        let needsCode = session.needsCodeForSensor
-        DispatchQueue.main.async {
-            self.isSearching = searching
-            self.needsCodeForSensor = needsCode
-        }
+        DispatchQueue.main.async { self.isSearching = searching }
     }
 }
 

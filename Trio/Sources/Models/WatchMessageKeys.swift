@@ -58,6 +58,18 @@ enum WatchMessageKeys {
     static let maxProtein = "maxProtein"
     static let bolusIncrement = "bolusIncrement"
     static let confirmBolusFaster = "confirmBolusFaster"
+    /// Settings › Bolus Calculator › Enable Reduced Bolus Option / Enable Super Bolus Option, for the watch's calculator.
+    static let reducedBolusOption = "reducedBolusOption"
+    static let superBolusOption = "superBolusOption"
+    /// A bolus recommendation asked for with a reduced or a super bolus.
+    static let useReducedBolus = "useReducedBolus"
+    static let useSuperBolus = "useSuperBolus"
+    /// Settings › Bolus Calculator › Meal-Time Reminder: on, and its presets in minutes.
+    static let mealTimeReminderEnabled = "mealTimeReminderEnabled"
+    static let mealTimeReminderPresets = "mealTimeReminderPresets"
+    /// With a bolus or carbs from the watch: remind to eat this many minutes after the bolus has been delivered.
+    static let mealTimeReminderMinutes = "mealTimeReminderMinutes"
+    static let mealTimeReminderCarbs = "mealTimeReminderCarbs"
 
     // Notification Actions
     static let snoozeDuration = "snoozeDuration"
@@ -70,6 +82,8 @@ enum WatchMessageKeys {
     /// The newest G7 reading the sensor marked unreliable (mg/dL and date): shown greyed with a warning, never used.
     static let unsureGlucoseMgdl = "unsureGlucoseMgdl"
     static let unsureGlucoseDate = "unsureGlucoseDate"
+    /// Whether the phone's "Show Unreliable G7 Readings" is on: the watch shows its own only then.
+    static let showUnreliableG7 = "showUnreliableG7"
     /// The watch app's push token, from the watch: the phone uploads it with its own so a remote command can also go
     /// straight to the watch while it has the pump.
     static let watchPushToken = "watchPushToken"

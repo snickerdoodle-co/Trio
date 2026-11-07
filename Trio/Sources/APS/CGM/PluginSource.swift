@@ -164,7 +164,8 @@ extension PluginSource: CGMManagerDelegate {
             case let .failure(error):
                 debug(.cgm, "CGM reading not usable: \(error.localizedDescription)")
                 // the G7 sent a value it marks unreliable: shown greyed, never used
-                if let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
+                if UnsureGlucoseStore.isEnabled,
+                   let g7 = manager as? G7CGMManager, let message = g7.latestReading, !message.hasReliableGlucose,
                    let glucose = message.glucose, let date = g7.latestReadingTimestamp
                 {
                     UnsureGlucoseStore.shared.add(UnsureGlucose(date: date, mgdl: Int(glucose)))
@@ -394,7 +395,24 @@ final class UnsureGlucoseStore: ObservableObject {
 
     private static let storageKey = "trio.unsureGlucose"
 
+    /// "Show Unreliable G7 Readings" on the CGM page; off unless turned on. Off, none are kept, shown or uploaded,
+    /// and the watch, told with every state update, shows none of its own either.
+    static let enabledKey = "trio.showUnreliableG7"
+    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+
+    /// Turning it off drops what is kept; either way the empty set tells the watch at once.
+    func setEnabled(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Self.enabledKey)
+        DispatchQueue.main.async { self.readings = [] }
+    }
+
     init() {
+        // a new sensor's readings count from after the old one's last, an unreliable one included
+        CGMSensorHandover.latestOtherReading = { UnsureGlucoseStore.shared.latest?.date }
+        guard Self.isEnabled else {
+            UserDefaults.standard.removeObject(forKey: Self.storageKey)
+            return
+        }
         if let data = UserDefaults.standard.data(forKey: Self.storageKey),
            let saved = try? JSONDecoder().decode([UnsureGlucose].self, from: data)
         {
@@ -414,6 +432,7 @@ final class UnsureGlucoseStore: ObservableObject {
     }
 
     func add(_ reading: UnsureGlucose) {
+        guard Self.isEnabled else { return }
         DispatchQueue.main.async {
             guard !self.readings.contains(where: { abs($0.date.timeIntervalSince(reading.date)) < 60 }) else { return }
             let now = Date()

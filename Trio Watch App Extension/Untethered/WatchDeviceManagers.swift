@@ -57,17 +57,6 @@ func watchCGMRecheckAcquisition(_ manager: CGMManager?) {
     (manager as? G7CGMManager)?.recheckAcquisition()
 }
 
-/// The app is leaving the screen: the CGM puts its next connect in before watchOS freezes the app.
-func watchCGMAppLeavingScreen(_ manager: CGMManager?) {
-    (manager as? G7CGMManager)?.appLeavingScreen()
-}
-
-/// The app is in front again: the G7 waits out the sensor's tail in the app and may scan for it (in the background
-/// it hands that wait to the daemon as a start delay; idea from xDrip4iOS 7.2.0).
-func watchCGMAppBecameActive(_ manager: CGMManager?) {
-    (manager as? G7CGMManager)?.appBecameActive()
-}
-
 /// The sensor's link is up right now: a reading or its backfill is on the radio.
 func watchCGMIsConnected(_ manager: CGMManager?) -> Bool {
     (manager as? G7CGMManager)?.isConnected ?? false

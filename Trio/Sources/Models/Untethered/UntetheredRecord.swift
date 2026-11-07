@@ -87,7 +87,10 @@ struct UntetheredSyncEntry: Codable, Equatable {
         for entry in entries {
             checksums[entry.bucket, default: UntetheredChecksum()].add(fnv1a(entry.key), fnv1a(entry.id.uuidString))
         }
-        return checksums.mapValues { Int(UInt32(truncatingIfNeeded: $0.transportValue)) }
+        // as a signed 32-bit number, the same on both sides: a 32-bit watch's Int can't hold a UInt32 above 2^31 and
+        // stopped there whenever the phone asked it to compare records (third tester, Apple Watch SE, 6 November:
+        // four crashes as Trio came to the front)
+        return checksums.mapValues { Int(Int32(bitPattern: UInt32(truncatingIfNeeded: $0.transportValue))) }
     }
 
     /// Contiguous from the oldest bucket, 0 for an empty one.

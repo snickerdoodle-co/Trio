@@ -303,7 +303,7 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
 
     private func glucoseStoreAndHeartDecision(syncDate: Date, glucose: [BloodGlucose]) async throws {
         // calibration add if required only for sensor
-        let newGlucose = overcalibrate(entries: glucose.filter { $0.sgv != nil })
+        var newGlucose = overcalibrate(entries: glucose.filter { $0.sgv != nil })
 
         var filteredByDate: [BloodGlucose] = []
         var filtered: [BloodGlucose] = []
@@ -325,6 +325,13 @@ final class BaseFetchGlucoseManager: FetchGlucoseManager, Injectable {
         }
         // before the filters: a reading the watch already sent is left out as stored, but the phone read it too
         PhoneOwnGlucose.noteReading(newGlucose)
+
+        // a new sensor's readings from while the old one was still read stay out of the history
+        newGlucose = CGMSensorHandover.dropOverlap(newGlucose, lastStored: syncDate)
+        guard newGlucose.isNotEmpty else {
+            endBackgroundTaskSafely(&backgroundTaskID, taskName: "Glucose Store and Heartbeat Decision")
+            return
+        }
 
         let backfillGlucose = newGlucose.filter { $0.dateString <= syncDate }
         if backfillGlucose.isNotEmpty {
@@ -548,5 +555,40 @@ enum PhoneOwnGlucose {
         defaults.set(reading.dateString, forKey: key)
         defaults.set(reading.glucose ?? reading.sgv ?? 0, forKey: valueKey)
         defaults.set(reading.direction?.rawValue ?? "", forKey: directionKey)
+    }
+}
+
+/// A new sensor hands over readings from before it was paired, the G7 up to 24 hours of them. Where the old sensor was
+/// still being read then, the two get mixed: on 6 November (second tester) the new sensor had run since 17:56 and was
+/// paired at 01:03, and its readings went into every gap of the old one's, 2 to 3.5 mmol/L higher (22:19 to 22:44,
+/// 00:04, 00:44 to 00:59). Its readings now count only from after the old sensor's last reading; into a true gap,
+/// where the old sensor had ended before, they still go.
+enum CGMSensorHandover {
+    private static let sensorKey = "trio.cgmHandover.sensor"
+    private static let cutoffKey = "trio.cgmHandover.cutoff"
+
+    /// The latest reading the old sensor gave besides the stored ones (an unreliable one, say).
+    static var latestOtherReading: () -> Date? = { nil }
+
+    static func dropOverlap(_ glucose: [BloodGlucose], lastStored: Date) -> [BloodGlucose] {
+        guard let sensor = glucose.compactMap(\.transmitterID).first(where: { !$0.isEmpty }) else { return glucose }
+        let defaults = UserDefaults.standard
+        if let known = defaults.string(forKey: sensorKey), known != sensor {
+            // the first readings of a new sensor: what Trio has so far is the old sensor's
+            let lastOld = max(lastStored, latestOtherReading() ?? .distantPast)
+            defaults.set(lastOld, forKey: cutoffKey)
+            info(.cgm, "New sensor: its readings count from after the old sensor's last reading at \(lastOld)")
+        }
+        defaults.set(sensor, forKey: sensorKey)
+
+        guard let cutoff = defaults.object(forKey: cutoffKey) as? Date else { return glucose }
+        let kept = glucose.filter { $0.transmitterID != sensor || $0.dateString > cutoff }
+        if kept.count < glucose.count {
+            debug(
+                .cgm,
+                "Left out \(glucose.count - kept.count) readings of the new sensor from while the old one was still read (until \(cutoff))"
+            )
+        }
+        return kept
     }
 }

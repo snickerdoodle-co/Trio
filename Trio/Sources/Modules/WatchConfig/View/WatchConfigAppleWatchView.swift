@@ -210,6 +210,26 @@ struct WatchConfigAppleWatchView: BaseView {
                     }
                     .listRowBackground(Color.chart)
                 }
+                SettingInputSection(
+                    decimalValue: $decimalPlaceholder,
+                    booleanValue: $state.untetheredTintHomeWatch,
+                    shouldDisplayHint: $shouldDisplayHint,
+                    selectedVerboseHint: Binding(
+                        get: { selectedVerboseHint },
+                        set: {
+                            selectedVerboseHint = $0.map { AnyView($0) }
+                            hintLabel = String(localized: "Tint Home Screen While Watch Loops")
+                        }
+                    ),
+                    units: state.units,
+                    type: .boolean,
+                    label: String(localized: "Tint Home Screen While Watch Loops"),
+                    miniHint: String(localized: "Color the whole home screen while the watch has the pump"),
+                    verboseHint: Text(
+                        "While the watch runs the loop, the home screen's background takes the untethered color, so you see at a glance that the phone doesn't dose. When this is off, only the bar at the bottom shows it."
+                    ),
+                    headerText: nil
+                )
 
                 UntetheredSettingsSection(manager: resolver.resolve(UntetheredPhoneManager.self)!)
             }

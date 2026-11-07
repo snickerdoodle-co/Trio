@@ -26,18 +26,14 @@ final class TrioWatchAppDelegate: NSObject, WKApplicationDelegate {
         _ = UntetheredWatchManager.shared
         WatchG7Reader.shared.bootstrap()
         WatchG7Reader.shared.scheduleBackgroundRefresh()
-        // Test for remote commands sent straight to the watch while the phone is away: whether a push reaches
-        // the watch app and wakes it. Only registers and logs; nothing acts on a push yet.
+        // remote commands sent straight to the watch while the phone is away (LoopFollow) arrive as pushes
         WKApplication.shared().registerForRemoteNotifications()
     }
 
     // MARK: - Push test
 
-    private static let pushTokenKey = "PushTest.token"
-
     func didRegisterForRemoteNotifications(withDeviceToken deviceToken: Data) {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
-        UserDefaults.standard.set(token, forKey: Self.pushTokenKey)
         // only its end, enough to tell a new token: logs get shared, and the token reaches the phone by its own way
         Task { await WatchLogger.shared.log("⌚️ Push test: watch push token …\(token.suffix(6))", force: true) }
         WatchRemoteCommands.sendTokenToPhone(token)

@@ -155,6 +155,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         Foundation.NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
+                Task { @MainActor in await self?.tickWhileWaiting() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
                     Task { @MainActor in await self?.checkForeignSession() }
                 }
@@ -162,7 +163,12 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             .store(in: &subscriptions)
         glucoseStorage.updatePublisher
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in Task { @MainActor in await self?.checkForeignSession() } }
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    await self?.checkForeignSession()
+                    await self?.tickWhileWaiting()
+                }
+            }
             .store(in: &subscriptions)
         broadcaster.register(SettingsObserver.self, observer: self)
         broadcaster.register(PreferencesObserver.self, observer: self)
@@ -336,7 +342,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         // The watch may start from this grant while the phone still holds the pod (phone off or out of reach). From
         // now on the phone refuses to command the pod if another controller used it since. Taking control back
         // clears this.
-        if Self.allowsStartWithoutPhone(settingsManager.settings), control.refusesForeignSessionsSince == nil {
+        if control.refusesForeignSessionsSince == nil {
             control.refusesForeignSessionsSince = Date()
         }
         guard let grant = try? await makeGrant(linkedOverrideID: nil, leaseLength: 0) else { return }
@@ -514,14 +520,16 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                     await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: status))
                 case .statusReport(holding: nil) where self.state.session.phase == .starting:
                     await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: nil))
-                case .records:
+                // only while idle: during the ownership check (`.starting`) records say nothing about who holds
+                // the pod, and taken as "not holding" they'd end the check and drop the records (below)
+                case .records where self.state.session.isIdle:
                     await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: nil))
                 default: break
                 }
             }
             switch envelope.message {
             case let .records(records):
-                let stored = await self.ingest(records, epoch: envelope.epoch)
+                let stored = await self.ingestInOrder(records, epoch: envelope.epoch)
                 // acknowledged as soon as stored, so the watch's backlog stays small while it loops
                 if let replyHandler,
                    let payload = try? UntetheredEnvelope(epoch: envelope.epoch, message: .recordsStored(stored)).payload()
@@ -719,6 +727,15 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         Task { await scheduleLinkedOverrideCheck() }
     }
 
+    /// The ticker is a timer, and a timer stands still while Trio is in the background: the wait for the watch's answer
+    /// ran 7 minutes instead of 3 (6 November, 07:36 to 07:43, until Trio was opened). Each reading and each return to
+    /// the front gives it its tick as well.
+    @MainActor private func tickWhileWaiting() async {
+        let phase = state.session.phase
+        guard phase == .preparing || phase == .starting else { return }
+        await apply(.tick)
+    }
+
     /// A refused pod command exposes the watch's newer EAP session before WatchConnectivity
     /// delivers its ownership message. Ask the watch while dosing stays held; if it cannot answer,
     /// the state machine takes the pod back and audits its delivery history.
@@ -909,7 +926,6 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         }
     }
 
-    private static let unreachable = String(localized: "The watch is not reachable. Open Trio on the watch and try again.")
 
     // MARK: - Starting
 
@@ -919,6 +935,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     private static func allowsStartWithoutPhone(_ settings: TrioSettings) -> Bool {
         settings.untetheredModeWatch && settings.allowUntetheredStartWithoutPhoneWatch
     }
+
+    /// The home screen is tinted while the watch has the pump (Settings › Apple Watch).
+    var tintsHomeScreen: Bool { isWatchInCharge && settingsManager.settings.untetheredTintHomeWatch }
 
     @MainActor private func preflight() throws {
         guard isEnabled else {
@@ -1167,7 +1186,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         let started = Date()
         var attempts = 0
         var bannerShown = false
-        while !state.podEndedOnWatch, !(await odometer.refreshDeliveredUnits()) {
+        while state.pumpReturnPending, !state.podEndedOnWatch, !(await odometer.refreshDeliveredUnits()) {
             attempts += 1
             debug(.watch, "Untethered: the pump did not answer yet (attempt \(attempts)), retrying")
             // with Bluetooth off nothing reaches the pod, and the watch has let go: said at once, as nobody doses
@@ -1189,6 +1208,11 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         }
         if bannerShown { setError(nil) }
         control?.endTakeEscalation()
+        // the watch holds the pump again (`.releasePump`): nothing to read back
+        guard state.pumpReturnPending else {
+            debug(.watch, "Untethered: pump return given up, the watch holds the pump")
+            return
+        }
         if !state.podEndedOnWatch {
             pumpReturnAnswered = true
             debug(
@@ -1391,8 +1415,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         let previous = state.podReading
         guard previous?.at != current.at else { return }
         UntetheredGate.update { $0.podReading = UntetheredPodReading(pod: pod, at: current.at, units: current.units) }
-        guard Self.allowsStartWithoutPhone(settingsManager.settings),
-              let previous, previous.pod == pod, current.at.timeIntervalSince(previous.at) >= Self.podGapCheck,
+        guard let previous, previous.pod == pod, current.at.timeIntervalSince(previous.at) >= Self.podGapCheck,
               current.units >= previous.units
         else { return }
         let point = UntetheredAuditPoint(
@@ -1522,12 +1545,30 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     // MARK: - History from the watch
 
+    /// The batch in flight, so the next one waits for it.
+    private var ingestTail: Task<Void, Never>?
+
+    /// One batch at a time: `ingest` suspends at every save, and batches arriving meanwhile (several per burst, and
+    /// resends after a reply timeout) would otherwise both see a record as new and store its carbs twice, or write
+    /// back the applied set over each other's entries.
+    @MainActor private func ingestInOrder(_ records: [UntetheredRecord], epoch: Int) async -> [UUID] {
+        let previous = ingestTail
+        let batch = Task { @MainActor () -> [UUID] in
+            await previous?.value
+            return await self.ingest(records, epoch: epoch)
+        }
+        ingestTail = Task { _ = await batch.value }
+        return await batch.value
+    }
+
     /// Returns the record versions now stored, including ones stored before.
     @MainActor private func ingest(_ records: [UntetheredRecord], epoch: Int) async -> [UUID] {
         // a session whose history is complete takes nothing more: a late copy (a queued transfer, a resend after a
         // relaunch) would store its carbs and doses a second time. Confirmed, so the watch lets go of it.
         let session = state.session
         guard state.applied[epoch] != nil || (epoch == session.epoch && !session.isIdle) else {
+            // a newer session's records aren't confirmed: the watch sends them again once the phone follows it
+            guard epoch <= session.epoch else { return [] }
             debug(.watch, "Untethered: \(records.count) record(s) of finished session \(epoch) ignored")
             return records.map(\.id)
         }
@@ -1932,10 +1973,13 @@ extension UntetheredPhoneManager: SettingsObserver, PreferencesObserver, PumpSet
 {
     func settingsDidChange(_ settings: TrioSettings) {
         scheduleStandingGrant(settingsChanged: true)
+        // the home screen's tint reads a setting
+        DispatchQueue.main.async { self.objectWillChange.send() }
         // with the start without the phone off, no other controller may use the pod: the guard set for it goes
-        if !settings.untetheredModeWatch || !settings.allowUntetheredStartWithoutPhoneWatch, UntetheredGate.phoneMayDose {
+        if !Self.allowsStartWithoutPhone(settings) {
             DispatchQueue.main.async { [weak self] in
                 guard let control = self?.apsManager.pumpManager as? ExclusiveDeviceControl,
+                      UntetheredGate.phoneMayDose || !control.isControlReleased,
                       control.refusesForeignSessionsSince != nil else { return }
                 control.refusesForeignSessionsSince = nil
             }
@@ -1946,12 +1990,6 @@ extension UntetheredPhoneManager: SettingsObserver, PreferencesObserver, PumpSet
         // turned off with the watch in charge: it hands back, as from the mode's own toggle
         if !settings.untetheredModeWatch, state.session.phase == .active {
             Task { @MainActor in await self.end() }
-        }
-        // the watch can't start without the phone anymore: nothing foreign to refuse
-        if !Self.allowsStartWithoutPhone(settings), let control = apsManager.pumpManager as? ExclusiveDeviceControl,
-           !control.isControlReleased
-        {
-            control.refusesForeignSessionsSince = nil
         }
     }
 
