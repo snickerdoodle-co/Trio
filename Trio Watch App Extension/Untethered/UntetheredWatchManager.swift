@@ -51,6 +51,8 @@ import WatchKit
     @ObservationIgnored var podRetryPending: (glucose: Date, failedAt: Date)?
     /// The meal-time reminder set with the bolus being delivered, until its estimated end: a cancel counts it from then.
     @ObservationIgnored var pendingMealReminder: (minutes: Int, deliveredBy: Date)?
+    /// When the watch's own meal-time reminder rings, for the countdown on the first page.
+    var mealReminderFireDate: Date?
     /// The session loops on the phone's readings: when the first was taken since the watch's own last one. Shown on
     /// the first page and the status page, and warned about after 20 minutes.
     var readingsFromPhoneSince: Date?
@@ -765,6 +767,7 @@ import WatchKit
         let deliveredAt = bolusWindow.map { max($0.end, Date()) } ?? Date().addingTimeInterval(delivery)
         let delay = deliveredAt.timeIntervalSinceNow + Double(minutes * 60)
         pendingMealReminder = units > 0 ? (minutes, deliveredAt) : nil
+        mealReminderFireDate = Date().addingTimeInterval(max(1, delay))
         notify(
             id: Self.notificationPrefix + "mealTimeReminder",
             title: String(localized: "Time to Eat", comment: "Meal-time reminder on the watch"),
@@ -777,6 +780,20 @@ import WatchKit
                 "⌚️ Untethered: meal-time reminder in \(Int((delay / 60).rounded())) min (\(minutes) min after the bolus)",
                 force: true
             )
+        }
+    }
+
+    /// The countdown on the first page was tapped: the watch's own reminder and its reminders to open Trio go.
+    func cancelMealReminder() {
+        let id = Self.notificationPrefix + "mealTimeReminder"
+        UNUserNotificationCenter.current().removePendingNotificationRequests(
+            withIdentifiers: [id] + ActionNotice.reminderDelays.indices.map { id + ".again\($0 + 1)" }
+        )
+        let wasPending = mealReminderFireDate.map { $0 > Date() } ?? false
+        pendingMealReminder = nil
+        mealReminderFireDate = nil
+        if wasPending {
+            Task { await WatchLogger.shared.log("⌚️ Untethered: meal-time reminder cancelled on the watch", force: true) }
         }
     }
 

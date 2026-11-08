@@ -480,6 +480,22 @@ import WatchKit
         setPeripheralIdentifier(nil)
         session?.update(credentials: credentials)
         pairingBecameDue()
+        // the iPhone may have a newer sensor the watch hasn't heard of yet
+        WatchState.shared.requestWatchStateUpdate()
+    }
+
+    /// "Pair sensor now" on the sensor page, while the watch has no key: asks the iPhone for the current sensor and
+    /// code, looks for the sensor at once and keeps Trio in front until the first reading. A missed "Open Trio to
+    /// Pair the Sensor" left only a greyed-out button behind the details (8 November, third tester: a new sensor on
+    /// the phone, no pairing on the watch, and no way to start it).
+    func pairNow() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        appendLog("Pairing: started from the sensor page")
+        WatchState.shared.requestWatchStateUpdate()
+        lastPairingAsk = nil
+        startSessionIfPossible()
+        session?.recheck()
+        keepInFrontForPairing()
     }
 
     private var credentials: WatchG7Credentials {
@@ -1061,7 +1077,7 @@ import WatchKit
     }
 
     /// The watch has no key for the sensor while it reads it itself: the next connection pairs.
-    private var isPairingDue: Bool {
+    var isPairingDue: Bool {
         isEnabled && !isStandingAside && !hasWatchKey && sensorName != nil
     }
 

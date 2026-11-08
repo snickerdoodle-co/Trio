@@ -69,6 +69,11 @@ enum WatchMessageKeys {
     static let mealTimeReminderPresets = "mealTimeReminderPresets"
     /// With a bolus or carbs from the watch: remind to eat this many minutes after the bolus has been delivered.
     static let mealTimeReminderMinutes = "mealTimeReminderMinutes"
+    /// The phone's pending meal-time reminder, for the countdown on the watch's first page: when it rings, 0 none.
+    static let mealTimeReminderAt = "mealTimeReminderAt"
+    /// From the watch: cancel the pending meal-time reminder (its countdown was tapped); the value is when the
+    /// reminder the watch showed rings, so a late cancel leaves a newer one alone.
+    static let cancelMealTimeReminder = "cancelMealTimeReminder"
     static let mealTimeReminderCarbs = "mealTimeReminderCarbs"
 
     // Notification Actions

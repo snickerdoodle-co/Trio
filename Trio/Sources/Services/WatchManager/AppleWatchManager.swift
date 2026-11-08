@@ -102,6 +102,15 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             }
             .store(in: &subscriptions)
 
+        // the meal-time reminder was set or cleared: its countdown on the watch follows at once
+        Foundation.NotificationCenter.default.publisher(for: .mealTimeReminderDidChange)
+            .receive(on: DispatchQueue.global(qos: .background))
+            .sink { [weak self] _ in
+                guard let self = self, let session = self.session, self.watchNeedsState(session) else { return }
+                self.pushWatchState()
+            }
+            .store(in: &subscriptions)
+
         iobService.iobPublisher
             .receive(on: DispatchQueue.global(qos: .background))
             .sink { [weak self] _ in
@@ -805,6 +814,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
         message[WatchMessageKeys.watchGlanceLayout] = settingsManager.settings.watchGlanceLayout.strings
         message[WatchMessageKeys.watchGlanceEnabled] = settingsManager.settings.watchGlanceEnabled
         message[WatchMessageKeys.useCriticalAlertsWatch] = settingsManager.settings.useCriticalAlerts
+        // the countdown on the watch's first page; 0 clears it there
+        message[WatchMessageKeys.mealTimeReminderAt] = mealTimeReminderService.pendingReminder?.fireDate.timeIntervalSince1970 ?? 0
         message[WatchMessageKeys.phoneAppVersion] = UntetheredVersion.current
         // carbs and boluses as markers on the watch chart: times only, the values would crowd a watch screen
         let treatments = await chartTreatments()
@@ -927,6 +938,11 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                 // Skip if no watch is paired or app not installed
                 guard let session = self.session, self.watchNeedsState(session) else { return }
                 self.pushWatchState()
+                return
+            }
+
+            if let fireAt = message[WatchMessageKeys.cancelMealTimeReminder] as? TimeInterval {
+                self.cancelMealTimeReminderFromWatch(fireAt)
                 return
             }
 
@@ -1080,6 +1096,11 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             Self.confirmWatchLogs(WatchLogIngest.acceptLegacy(userInfo))
         }
 
+        if let fireAt = userInfo[WatchMessageKeys.cancelMealTimeReminder] as? TimeInterval {
+            Task { @MainActor [weak self] in self?.cancelMealTimeReminderFromWatch(fireAt) }
+            return
+        }
+
         if let snoozeMinutes = userInfo[WatchMessageKeys.snoozeDuration] as? Int {
             info(.watch, "Watch requested alert snooze for \(snoozeMinutes) min")
             Task { @MainActor [weak self] in
@@ -1087,6 +1108,19 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                 await self.notificationsManager.applySnooze(for: TimeInterval(snoozeMinutes * 60))
             }
         }
+    }
+
+    /// The countdown on the watch was tapped. Only the reminder the watch showed goes: the message may come late
+    /// (queued while the phone was off), and a newer reminder set meanwhile stays.
+    @MainActor private func cancelMealTimeReminderFromWatch(_ fireAt: TimeInterval) {
+        guard let pending = mealTimeReminderService.pendingReminder,
+              abs(pending.fireDate.timeIntervalSince1970 - fireAt) < 2
+        else {
+            info(.watch, "Watch cancelled a meal-time reminder that is no longer pending")
+            return
+        }
+        info(.watch, "Watch cancelled the meal-time reminder")
+        mealTimeReminderService.cancelPendingReminders()
     }
 
     /// Uploaded with the phone's own token (`NightscoutManager.uploadProfiles`), so LoopFollow can send a remote
@@ -1166,10 +1200,10 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                 info(.bolus, "Watch bolus of \(amount) U waited \(waited) s for the pump to come back from the watch")
             }
             await apsManager.enactBolus(amount: Double(amount), isSMB: false) { success, message in
-                // as the calculator: the reminder counts from the end of the delivery
+                // as the calculator: once the bolus command was accepted, the reminder counts from now
                 if success, let reminder {
                     Task {
-                        await self.mealTimeReminderService.prepareEatReminder(
+                        await self.mealTimeReminderService.scheduleEatReminder(
                             after: reminder.leadTime,
                             carbs: reminder.carbs,
                             bolusAmount: amount

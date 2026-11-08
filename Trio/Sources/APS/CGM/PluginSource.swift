@@ -52,24 +52,41 @@ final class PluginSource: GlucoseSource {
         cgmProgressHighlight.value = cgmManager?.cgmLifecycleProgress
     }
 
-    /// The glucose timer's nudge: asks the CGM manager for new data when some is due. The readings reach Trio through
-    /// the delegate (`cgmManager(_:hasNew:)`), never through this publisher, which finishes empty.
+    /// Function that fetches blood glucose data
+    /// This function combines two data fetching mechanisms (`callBLEFetch` and `fetchIfNeeded`) into a single publisher.
+    /// It returns the first non-empty result from either of the sources within a 5-minute timeout period.
+    /// If no valid data is fetched within the timeout, it returns an empty array.
     ///
-    /// Before, a `Future` answered with an empty list that a filter then dropped, and a 5-minute timeout ended it with
-    /// another empty list: nothing ever came through it. The filter's check of that list crashed the app once
-    /// (6 November, build 134: EXC_BAD_ACCESS in `PluginSource.fetch`, `!$0.isEmpty`, on the glucose manager's queue,
-    /// with the answer delivered from the CGM manager's).
+    /// - Parameter timer: An optional `DispatchTimer` (not used in the function but can be used to trigger fetch logic).
+    /// - Returns: An `AnyPublisher` that emits an array of `BloodGlucose` values or an empty array if an error occurs or the timeout is reached.
     func fetch(_: DispatchTimer?) -> AnyPublisher<[BloodGlucose], Never> {
         fetchIfNeeded()
+            .filter { !$0.isEmpty }
+            .first()
+            .timeout(60 * 5, scheduler: processQueue, options: nil, customError: nil)
+            .replaceError(with: [])
+            .eraseToAnyPublisher()
     }
 
     func fetchIfNeeded() -> AnyPublisher<[BloodGlucose], Never> {
-        processQueue.async { [weak self] in
-            // what it returns is left out on purpose: it comes from the Share client and would race the CGM's own
-            // reading (G6 with Share credentials only)
-            self?.cgmManager?.fetchNewDataIfNeeded { _ in }
+        Future<[BloodGlucose], Error> { [weak self] promise in
+            guard let self = self else { return }
+            self.processQueue.async {
+                guard let cgmManager = self.cgmManager else { return }
+                cgmManager.fetchNewDataIfNeeded { _ in
+                    // Ignore values returned from fetchNewDataIfNeeded since
+                    // these come from share client and cause a race condition
+                    // that causes the promise to complete before a CGM value
+                    // has a chance to return. From looking at the code this should
+                    // only impact G6 since that is the only CGM manager that will
+                    // return data and only if share credentials are set
+                    promise(.success([]))
+                }
+            }
         }
-        return Empty().eraseToAnyPublisher()
+        .replaceError(with: [])
+        .replaceEmpty(with: [])
+        .eraseToAnyPublisher()
     }
 
     deinit {

@@ -92,6 +92,35 @@ import WatchKit
         didSet { UserDefaults.standard.set(mealTimeReminderPresets, forKey: WatchMessageKeys.mealTimeReminderPresets) }
     }
 
+    /// The phone's pending meal-time reminder, as it last sent it: when it rings.
+    var phoneMealReminderAt: Date?
+
+    /// The next meal-time reminder, the phone's or the watch's own while it has the pump, for the countdown on the
+    /// first page; nil once it has rung.
+    var pendingMealReminderAt: Date? {
+        let now = Date()
+        return [phoneMealReminderAt, UntetheredWatchManager.shared.mealReminderFireDate]
+            .compactMap { $0 }
+            .filter { $0 > now }
+            .min()
+    }
+
+    /// The countdown was tapped: both the watch's own reminder and the phone's go.
+    func cancelMealTimeReminder() {
+        UntetheredWatchManager.shared.cancelMealReminder()
+        guard let fireAt = phoneMealReminderAt, fireAt > Date() else { return }
+        phoneMealReminderAt = nil
+        guard let session, session.activationState == .activated else { return }
+        // which reminder: a cancel that arrives late doesn't take a newer one with it
+        let message: [String: Any] = [WatchMessageKeys.cancelMealTimeReminder: fireAt.timeIntervalSince1970]
+        if session.isReachable {
+            session.sendMessage(message, replyHandler: nil) { _ in session.transferUserInfo(message) }
+        } else {
+            // the phone may be off or away: it cancels when the message arrives
+            session.transferUserInfo(message)
+        }
+    }
+
     /// This meal's reminder on the bolus page, in minutes; 0 is off. Off each time the page opens, as on the phone.
     var mealTimeReminderMinutes = 0
 
@@ -761,6 +790,10 @@ import WatchKit
         }
         if let presets = message[WatchMessageKeys.mealTimeReminderPresets] as? [Int], presets != mealTimeReminderPresets {
             mealTimeReminderPresets = presets
+        }
+        if let fireAt = message[WatchMessageKeys.mealTimeReminderAt] as? TimeInterval {
+            let date = fireAt > 0 ? Date(timeIntervalSince1970: fireAt) : nil
+            if date != phoneMealReminderAt { phoneMealReminderAt = date }
         }
 
         if let reduced = message[WatchMessageKeys.reducedBolusOption] as? Bool {
