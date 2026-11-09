@@ -240,8 +240,8 @@ import WatchKit
         }
         if phoneUsesG7Direct == false, sensorName == nil {
             return String(
-                localized: "iPhone isn't on G7 direct",
-                comment: "Watch G7 status: the phone is not using G7 direct"
+                localized: "No sensor from the iPhone",
+                comment: "Watch G7 status: the phone passes no G7 to the watch"
             )
         }
         guard sensorName != nil else {
@@ -252,7 +252,7 @@ import WatchKit
         }
         if pairingCode == nil, !hasWatchKey {
             return String(
-                localized: "No pairing code",
+                localized: "No pairing code from the iPhone",
                 comment: "Watch G7 status: the phone has no pairing code"
             )
         }
@@ -490,6 +490,11 @@ import WatchKit
     /// the phone, no pairing on the watch, and no way to start it).
     func pairNow() {
         dispatchPrecondition(condition: .onQueue(.main))
+        // a tap while the pairing already runs only asks the iPhone again (8 November: 50 taps in 20 minutes, each a line)
+        guard pairingKeepAlive?.isRunning != true else {
+            WatchState.shared.requestWatchStateUpdate()
+            return
+        }
         appendLog("Pairing: started from the sensor page")
         WatchState.shared.requestWatchStateUpdate()
         lastPairingAsk = nil

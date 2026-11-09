@@ -101,9 +101,26 @@ struct WatchG7View: View {
     }
 
     /// Right under the status, never greyed out: without a key it starts the pairing now (a new sensor, or a missed
-    /// "Open Trio to Pair the Sensor"); with one it forgets the key and pairs again, after a confirmation.
+    /// "Open Trio to Pair the Sensor"); with one it forgets the key and pairs again, after a confirmation. Without the
+    /// sensor or its code from the iPhone nothing can pair: it says what to do on the iPhone instead (8 November, third
+    /// tester: Trio read the G7 through the Dexcom app with no code entered, and "Pair sensor now" was tapped 50 times).
     @ViewBuilder private var pairingButton: some View {
-        if reader.hasWatchKey {
+        if !reader.hasWatchKey, reader.sensorName == nil || reader.pairingCode == nil {
+            Text(
+                "On the iPhone, open Trio › Dexcom G7 › Apple Watch: turn on Read on Apple Watch and enter the sensor's 4-digit pairing code. It is printed on the applicator and shown in the Dexcom app.",
+                comment: "Watch sensor page: the watch has no sensor or code from the iPhone yet"
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+
+            Button {
+                WatchState.shared.requestWatchStateUpdate()
+            } label: {
+                Text("Check iPhone again", comment: "Button: ask the iPhone for the sensor and its pairing code")
+                    .font(.footnote)
+            }
+        } else if reader.hasWatchKey {
             Button(role: .destructive) {
                 showResetConfirmation = true
             } label: {

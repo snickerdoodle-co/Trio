@@ -691,8 +691,11 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     private func watchG7Details() -> [String: Any] {
         var details: [String: Any] = [WatchMessageKeys.watchDisplayUnits: settingsManager.settings.units.rawValue]
 
+        // Reading through the Dexcom app, the phone has no code of its own: with Read on Apple Watch on, the code
+        // entered for the watch (Dexcom G7 › Apple Watch) goes, or "" so the watch says it is missing. Before, the
+        // watch's own reader got no sensor at all in that mode (8 November, third tester: "Sensor: –").
         if let g7 = fetchGlucoseManager?.cgmManager as? G7CGMManager,
-           g7.state.sessionMode == .direct,
+           g7.state.sessionMode == .direct || g7.isWatchDirectReadEnabled,
            let sensorName = g7.state.sensorID
         {
             details[WatchMessageKeys.g7DirectSensorName] = sensorName
