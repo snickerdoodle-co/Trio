@@ -81,6 +81,8 @@ enum WatchMessageKeys {
     static let snoozeUntilDate = "snoozeUntilDate"
     /// The newest reading the phone's own CGM delivered; the glucose values may also hold the watch's own.
     static let phoneOwnGlucoseDate = "phoneOwnGlucoseDate"
+    /// When the phone last enacted a temp basal or bolus: with its own readings, what tells the watch the phone loops.
+    static let phoneLastDoseDate = "phoneLastDoseDate"
     /// While the watch has the pump: the phone's own newest reading (date, mg/dL, direction), for a session whose
     /// own sensor link failed.
     static let untetheredPhoneReading = "untetheredPhoneReading"

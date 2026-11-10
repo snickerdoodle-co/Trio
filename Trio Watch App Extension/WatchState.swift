@@ -971,15 +971,20 @@ extension WatchState {
         let session = WCSession.default
         guard WCSession.isSupported(), session.activationState == .activated else { return }
         Self.lastBatteryReport = (percent, charging, now)
-        for transfer in session.outstandingUserInfoTransfers where transfer.userInfo[WatchMessageKeys.watchBattery] != nil {
-            transfer.cancel()
+        let date = now.timeIntervalSince1970
+        // off the main thread: the transfer list's read hung it for 20 minutes (`WCTransfers`)
+        WCTransfers.run {
+            let session = WCSession.default
+            for transfer in session.outstandingUserInfoTransfers where transfer.userInfo[WatchMessageKeys.watchBattery] != nil {
+                transfer.cancel()
+            }
+            session.transferUserInfo([
+                WatchMessageKeys.watchBattery: [
+                    "percent": percent,
+                    "charging": charging,
+                    "date": date
+                ]
+            ])
         }
-        session.transferUserInfo([
-            WatchMessageKeys.watchBattery: [
-                "percent": percent,
-                "charging": charging,
-                "date": now.timeIntervalSince1970
-            ]
-        ])
     }
 }

@@ -86,8 +86,12 @@ import WatchKit
     @ObservationIgnored var lastPodLinkNotice: Date?
     /// When the phone was last heard from: any untethered message, or the phone reachable.
     @ObservationIgnored var lastPhoneContact: Date?
+    /// Since when the answer to the phone's ownership question waits for a reply that shows the phone has it.
+    @ObservationIgnored var ownershipAnswerUnconfirmedSince: Date?
     /// The fallback's hand-back is waiting out its minute.
     @ObservationIgnored var fallbackHandbackPending = false
+    /// When the watch last logged that it keeps the pump from a phone without readings.
+    @ObservationIgnored var fallbackHandbackHeldLoggedAt: Date?
     /// This stall's request to the phone to take the pump back.
     @ObservationIgnored var handbackRequestedAt: Date?
     /// How many Pod Not Reachable notices this stall has brought; from the second on the watch vibrates harder.
@@ -333,6 +337,19 @@ import WatchKit
             answerSync(epoch: envelope.epoch, bucketStart: bucketStart, checksums: checksums)
 
         case let .commit(handover):
+            // the deadline by the watch's clock, and how long ago the phone sent it by its own: both clocks normally
+            // agree within a second, so a delay well off the delivery time points at the clocks
+            if let lease = handover.leaseExpiresAt {
+                let now = Date()
+                let sent = handover.committedAt.map { String(format: "%.1f s", now.timeIntervalSince($0)) } ?? "unknown"
+                Task {
+                    await WatchLogger.shared.log(
+                        "⌚️ Untethered: commit in, deadline in \(String(format: "%.1f", lease.timeIntervalSince(now))) s " +
+                            "by the watch's clock; first sent \(sent) ago by the phone's",
+                        force: true
+                    )
+                }
+            }
             apply(.received(envelope.message, epoch: envelope.epoch), reply: replyHandler) {
                 if $0.session.phase == .starting, $0.session.epoch == envelope.epoch { $0.handover = handover }
             }
@@ -446,7 +463,42 @@ import WatchKit
             if self.data.podEnded, self.data.session.phase == .active { self.end() }
             self.notePhoneReturn()
             self.checkLinkedOverride()
+            self.resendOwnershipAnswerIfUnconfirmed()
         }
+    }
+
+    /// The phone holds its dosing until the answer to its ownership question comes, and a queued answer reaches it only
+    /// when Trio runs on the phone: a queued transfer doesn't wake it, a message does. On 9 November (second tester)
+    /// the question came at 10:40:03, the answer went queued, Trio on the phone went back to sleep, its next reading
+    /// didn't come, and it held its dosing until it was opened at 10:48. So the answer goes again as a message at the
+    /// watch's next wakes while the phone is in reach, for up to 15 minutes, until the phone replies to one.
+    static let ownershipAnswerRetryWindow: TimeInterval = 15 * 60
+
+    private func sendOwnershipAnswer(_ message: UntetheredMessage, epoch: Int) {
+        ownershipAnswerUnconfirmedSince = Date()
+        send(message, epoch: epoch, onDelivered: { [weak self] in self?.ownershipAnswerUnconfirmedSince = nil })
+    }
+
+    /// At a wake of the watch's (a reading, the phone coming in reach): the answer as it stands now, never the one
+    /// first given, so a takeover since then is reported as holding.
+    func resendOwnershipAnswerIfUnconfirmed() {
+        guard let since = ownershipAnswerUnconfirmedSince else { return }
+        guard Date().timeIntervalSince(since) < Self.ownershipAnswerRetryWindow else {
+            ownershipAnswerUnconfirmedSince = nil
+            return
+        }
+        guard WCSession.default.activationState == .activated, WCSession.default.isReachable else { return }
+        let session = data.session
+        let holding = session.phase == .active || session.phase == .ending ? session.startStatus : nil
+        Task {
+            await WatchLogger.shared.log("⌚️ Untethered: the phone hasn't confirmed the ownership answer; sent again", force: true)
+        }
+        send(
+            .statusReport(holding: holding),
+            epoch: session.epoch,
+            queueing: false,
+            onDelivered: { [weak self] in self?.ownershipAnswerUnconfirmedSince = nil }
+        )
     }
 
     /// Why this grant can't run here, or nil.
@@ -534,8 +586,10 @@ import WatchKit
                 if let replyHandler = reply {
                     self.reply(message, epoch: epoch, via: replyHandler)
                     reply = nil
+                } else if case .statusReport = message {
+                    // queued by `send` itself, and sent again until the phone is seen to have it
+                    sendOwnershipAnswer(message, epoch: epoch)
                 } else {
-                    // `.statusReport`, the answer to the phone's ownership question, is queued by `send` itself
                     send(message, epoch: epoch)
                 }
             case .takeover:
@@ -641,6 +695,7 @@ import WatchKit
         epoch: Int,
         queueing: Bool? = nil,
         onReply: (() -> Void)? = nil,
+        onDelivered: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
         guard WCSession.isSupported(), WCSession.default.activationState == .activated,
@@ -679,6 +734,7 @@ import WatchKit
         for part in UntetheredChunks.split(payload) ?? [payload] {
             session.sendMessage(part, replyHandler: { [weak self] reply in
                 DispatchQueue.main.async { self?.phoneTroubleAt = nil }
+                if let onDelivered { DispatchQueue.main.async(execute: onDelivered) }
                 guard reply[UntetheredEnvelope.key] != nil else { return }
                 self?.receive(reply, replyHandler: nil)
                 // queued behind the reply's own handling, which `receive` puts on the main queue
@@ -940,6 +996,9 @@ import WatchKit
             self.streamRecords()
             // the phone reads the sensor again: a session the fallback started goes back to it
             if let phoneReading, Date().timeIntervalSince(phoneReading) < 10 * 60, self.isFallbackSession {
+                // the hand-back checks the phone's newest reading: the wake's, as its state may not have come yet
+                // (9 November: the phone read again after its sensor was paired anew, and the watch kept the pump)
+                WatchG7Reader.shared.notePhoneOwnReading(phoneReading)
                 Task {
                     await WatchLogger.shared.log(
                         "⌚️ Untethered: fallback — the phone reads the sensor again (\(phoneReading.formatted(date: .omitted, time: .shortened)))",
@@ -963,13 +1022,20 @@ import WatchKit
 
     /// A background refresh as the backstop wake: if a connect is still missing, it is put in on that wake.
     /// One refresh is pending per app at a time; this one replaces the watch reader's while a session runs.
+    /// Each reading and each leaving of the screen puts it off again, so it only comes when a reading is missing.
+    /// 7 minutes: just past the point where the sensor's acquisition counts a standing request as lost (one window
+    /// of 5 minutes and 90 s, `G7WatchAcquisition.recheck`), so that wake renews it. At 10 minutes a request lost at
+    /// the start of a session with the Workout app in front stood until Trio was opened (9 November, 05:04 to
+    /// 05:11:54: 452 s without a link, "No Sensor Readings" after 11 minutes).
     func scheduleSessionRefresh() {
         guard isActive else { return }
         WKApplication.shared().scheduleBackgroundRefresh(
-            withPreferredDate: Date().addingTimeInterval(10 * 60),
+            withPreferredDate: Date().addingTimeInterval(Self.sessionRefreshDelay),
             userInfo: nil
         ) { _ in }
     }
+
+    static let sessionRefreshDelay: TimeInterval = 7 * 60
 
     func recheckCGM() {
         watchCGMRecheckAcquisition(cgmManager)
@@ -1062,13 +1128,19 @@ import WatchKit
               (standingGrantRequestedAt ?? .distantPast).addingTimeInterval(Self.standingGrantRequestInterval) < now
         else { return }
         standingGrantRequestedAt = now
-        // queued, so a phone out of reach or asleep answers once it can; only the newest request waits
-        for transfer in WCSession.default.outstandingUserInfoTransfers
-            where (try? UntetheredEnvelope.decode(transfer.userInfo))?.message == .standingGrantRequest
-        {
-            transfer.cancel()
+        // queued, so a phone out of reach or asleep answers once it can; only the newest request waits. The list is
+        // read off the main thread (`WCTransfers`), and the request sent once the older ones are cancelled.
+        let epoch = data.session.epoch
+        WCTransfers.run {
+            for transfer in WCSession.default.outstandingUserInfoTransfers
+                where (try? UntetheredEnvelope.decode(transfer.userInfo))?.message == .standingGrantRequest
+            {
+                transfer.cancel()
+            }
+            DispatchQueue.main.async {
+                self.send(.standingGrantRequest, epoch: epoch, queueing: true)
+            }
         }
-        send(.standingGrantRequest, epoch: data.session.epoch, queueing: true)
     }
 
     /// Why there is no start without the phone, for the status page; nil when one can start.
@@ -1240,9 +1312,10 @@ import WatchKit
 
     /// From the wrist, or because the linked override is over. Needs the phone close by.
     func end() {
-        guard !isBolusing else {
-            setError(String(localized: "Wait for the bolus to finish, or stop it, before handing back."))
-            return
+        if isBolusing {
+            Task {
+                await WatchLogger.shared.log("⌚️ Untethered: End tapped during a bolus — handing back, the bolus goes on on the pod", force: true)
+            }
         }
         guard WCSession.default.isReachable else {
             setError(
@@ -1272,9 +1345,17 @@ import WatchKit
             guard self.data.session.phase == .ending else { return }
             // from here no loop or bolus: the last read is the last command to the pod
             self.isFinalizing = true
-            // a hand-back asked for by the phone also waits for a running bolus; a loop only so long
+            // A running bolus doesn't hold the hand-back up: the pod delivers it whoever has the pod, the last
+            // records report it as running, and the phone keeps it as reported (`freezeWatchDoses`), as after a
+            // take-back during a bolus (9 November, 13:38: 66 s into 2 U, audit 1.7 U / 1.71 U). Waiting for it made
+            // End seem to do nothing for over a minute. A loop is waited for, only so long.
             let loopWaitUntil = Date().addingTimeInterval(Self.handbackPodLimit)
-            while self.isBolusing || (self.isLooping && Date() < loopWaitUntil) {
+            if self.isBolusing {
+                Task {
+                    await WatchLogger.shared.log("⌚️ Untethered: hand-back during a bolus — it goes on on the pod", force: true)
+                }
+            }
+            while self.isLooping, Date() < loopWaitUntil {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
             if self.isLooping {
@@ -1803,10 +1884,11 @@ extension UntetheredWatchManager {
         guard fallbackOn, data.session.phase == .idle, !isBusy, !WCSession.default.isReachable,
               versionMismatch == nil, standingGrantAge != nil
         else { return }
-        // The phone's newest reading, not any contact: on 22 October at 17:05 the phone, Bluetooth off in a metal
-        // pot, got through for 5 s with only its 16:50 reading, and counting that contact put the start back by
-        // 15 minutes. A phone without new readings isn't looping, whether it answers or not.
-        let phoneNewest = WatchG7Reader.shared.phoneGlucoseDate ?? .distantPast
+        // The phone's newest reading or its last dose, not any contact: on 22 October at 17:05 the phone, Bluetooth
+        // off in a metal pot, got through for 5 s with only its 16:50 reading, and counting that contact put the start
+        // back by 15 minutes. A phone without new readings or doses isn't looping, whether it answers or not. Its
+        // dose counts so one missed reading doesn't bring a look (8 November, 17:21: a minute after the phone's bolus).
+        let phoneNewest = WatchG7Reader.shared.phoneLoopSign ?? .distantPast
         let silence = now.timeIntervalSince(phoneNewest)
         let ownNewer = readerReadings.filter { $0 > phoneNewest.addingTimeInterval(60) }.count
         if let paused = fallbackLooksPaused {
@@ -1848,7 +1930,7 @@ extension UntetheredWatchManager {
             }
             try? await Task.sleep(nanoseconds: UInt64(Self.fallbackProbeDelay * 1_000_000_000))
             // the phone may have been heard meanwhile, or a session begun
-            guard self.data.session.phase == .idle, (WatchG7Reader.shared.phoneGlucoseDate ?? .distantPast) == phoneNewest
+            guard self.data.session.phase == .idle, (WatchG7Reader.shared.phoneLoopSign ?? .distantPast) == phoneNewest
             else { return }
             let minutes = Int(Date().timeIntervalSince(phoneNewest) / 60)
             switch await self.lookAtPod() {
@@ -2079,7 +2161,7 @@ extension UntetheredWatchManager {
         }
         guard data.session.phase == .idle || message == .revoke else { return }
         dropFallbackWitness()
-        let phoneNewest = WatchG7Reader.shared.phoneGlucoseDate ?? .distantPast
+        let phoneNewest = WatchG7Reader.shared.phoneLoopSign ?? .distantPast
         fallbackLooksPaused = (phoneNewest, Date().addingTimeInterval(Self.fallbackLookPause))
         Task { await WatchLogger.shared.log("⌚️ Untethered: fallback — the phone was just at the pod, no look for 9 min", force: true) }
     }
@@ -2213,7 +2295,7 @@ extension UntetheredWatchManager {
     /// (2026-10-21: the walk's request reached the phone on its own). The status goes first, so the phone knows the
     /// session the request names.
     func scheduleFallbackHandback(grace: TimeInterval = UntetheredWatchManager.fallbackHandbackGrace) {
-        guard isFallbackSession, data.session.phase == .active, !fallbackHandbackPending else { return }
+        guard isFallbackSession, data.session.phase == .active, !fallbackHandbackPending, phoneCanLoop() else { return }
         fallbackHandbackPending = true
         DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
             guard let self else { return }
@@ -2221,7 +2303,7 @@ extension UntetheredWatchManager {
             // The fallback's own request goes again every 5 minutes while the phone shows up, not every 30 as a
             // stall's: on 23 October the phone's first take-back (07:49) found no pod link in 5 s, the requests at
             // the phone's next appearances (07:50 to 08:20) were held back, and the watch kept the pump until 08:25.
-            guard self.isFallbackSession, self.data.session.phase == .active, !self.isBolusing,
+            guard self.isFallbackSession, self.data.session.phase == .active, !self.isBolusing, self.phoneCanLoop(),
                   Date().timeIntervalSince(self.handbackRequestedAt ?? .distantPast) > Self.fallbackHandbackRepeat
             else { return }
             self.handbackRequestedAt = Date()
@@ -2230,6 +2312,28 @@ extension UntetheredWatchManager {
             self.send(.handbackRequested(minutesWithoutLoop: 0), epoch: self.data.session.epoch, queueing: true)
             self.holdOffPodForTakeBack()
         }
+    }
+
+    /// The phone in reach isn't enough to hand back: on 8 November the phone's sensor had been removed at 11:48, the
+    /// watch took over at 12:01 and handed back at 12:11 because the phone was in reach again, and the phone, with no
+    /// glucose, didn't loop until 14:06. So the pump goes back once the phone has a reading of its own from the last
+    /// 10 minutes. While the watch reads none either, it goes back as before: then neither loops, and the phone is
+    /// where the pump can be used by hand. Ending by hand or the phone's take-back are unaffected.
+    private func phoneCanLoop(now: Date = Date()) -> Bool {
+        let window: TimeInterval = 10 * 60
+        if let phone = WatchG7Reader.shared.phoneGlucoseDate, now.timeIntervalSince(phone) < window { return true }
+        guard let own = ownReadingAt, now.timeIntervalSince(own) < window else { return true }
+        if now.timeIntervalSince(fallbackHandbackHeldLoggedAt ?? .distantPast) > 15 * 60 {
+            fallbackHandbackHeldLoggedAt = now
+            let minutes = WatchG7Reader.shared.phoneGlucoseDate.map { "\(Int(now.timeIntervalSince($0) / 60)) min" } ?? "none"
+            Task {
+                await WatchLogger.shared.log(
+                    "⌚️ Untethered: fallback — the phone is back without a reading of its own (newest: \(minutes)); the watch keeps the pump",
+                    force: true
+                )
+            }
+        }
+        return false
     }
 
     /// The phone's watch state arrived: with a reading of its own from the last 10 minutes, the phone is back.

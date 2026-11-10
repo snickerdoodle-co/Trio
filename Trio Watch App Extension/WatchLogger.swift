@@ -2,6 +2,28 @@ import Foundation
 import os
 import WatchConnectivity
 
+/// WatchConnectivity's lists of queued transfers are read with a call that waits on its framework and can hang for
+/// minutes when WatchConnectivity stalls: on 9 November from about 13:16 the main thread (`reportBatteryIfChanged`)
+/// and both of the watch's cooperative threads (the two log senders) waited there at once, nothing else ran, no
+/// sensor reading for 20 minutes, until watchOS killed Trio at 13:36:52 for a screen update it couldn't answer
+/// (first tester's crash report, build 732). Those reads now run on this queue alone: a stall holds it, not the main
+/// thread and not Swift's thread pool, whose tasks wait for it without holding a thread.
+enum WCTransfers {
+    static let queue = DispatchQueue(label: "org.nightscout.trio.watch.wc-transfers", qos: .utility)
+
+    /// Work with the transfer lists, off the main thread and the thread pool.
+    static func run(_ work: @escaping () -> Void) {
+        queue.async(execute: work)
+    }
+
+    /// The same, for a caller that needs the answer: it waits without holding a thread.
+    static func read<T>(_ work: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: work()) }
+        }
+    }
+}
+
 final class WatchLogger: Sendable {
     static let shared = WatchLogger()
 
@@ -137,17 +159,17 @@ private actor WatchLogShipper {
     private let outbox = WatchLogRing.defaultDirectory.deletingLastPathComponent()
         .appendingPathComponent("WatchLogOutbox", isDirectory: true)
 
-    private func openRing() -> WatchLogRing {
+    private func openRing() async -> WatchLogRing {
         if let ring { return ring }
         let ring = WatchLogRing()
         ring.prune()
         self.ring = ring
         sentSeq = ring.ackedSeq
-        clearOutbox()
+        await clearOutbox()
         return ring
     }
 
-    func drain(_ pending: OSAllocatedUnfairLock<WatchLogger.PendingDrafts>) {
+    func drain(_ pending: OSAllocatedUnfairLock<WatchLogger.PendingDrafts>) async {
         let drafts = pending.withLock { state -> [WatchLogDraft] in
             defer {
                 state.drafts.removeAll(keepingCapacity: true)
@@ -156,23 +178,28 @@ private actor WatchLogShipper {
             return state.drafts
         }
         guard !drafts.isEmpty else { return }
-        let ring = openRing()
+        let ring = await openRing()
         ring.append(drafts)
         ring.prune()
     }
 
-    func ship(onRequest: Bool) {
-        let ring = openRing()
+    func ship(onRequest: Bool) async {
+        let ring = await openRing()
         let session = WCSession.default
         guard session.activationState == .activated, session.isCompanionAppInstalled else { return }
 
-        let outstanding = session.outstandingFileTransfers.filter { $0.file.metadata?[WatchLogTransfer.marker] != nil }
+        // read and cancelled on `WCTransfers.queue`: the list's read can hang
         let cutoff = Date().timeIntervalSince1970 - Self.staleTransfer
-        let stale = outstanding.filter { ($0.file.metadata?[WatchLogTransfer.created] as? TimeInterval ?? 0) < cutoff }
-        if !stale.isEmpty {
+        let (outstandingCount, staleCount) = await WCTransfers.read { () -> (Int, Int) in
+            let outstanding = WCSession.default.outstandingFileTransfers
+                .filter { $0.file.metadata?[WatchLogTransfer.marker] != nil }
+            let stale = outstanding.filter { ($0.file.metadata?[WatchLogTransfer.created] as? TimeInterval ?? 0) < cutoff }
             stale.forEach { $0.cancel() }
+            return (outstanding.count, stale.count)
+        }
+        if staleCount > 0 {
             sentSeq = ring.ackedSeq
-        } else if !outstanding.isEmpty, !onRequest {
+        } else if outstandingCount > 0, !onRequest {
             return
         }
 
@@ -210,16 +237,18 @@ private actor WatchLogShipper {
         }
     }
 
-    func acknowledge(_ seq: UInt64, installID: String?) {
-        let ring = openRing()
+    func acknowledge(_ seq: UInt64, installID: String?) async {
+        let ring = await openRing()
         guard installID == ring.installID else { return }
         ring.acknowledge(seq)
         sentSeq = max(sentSeq, ring.ackedSeq)
     }
 
     // Batches left over from an earlier launch are rebuilt from the ring
-    private func clearOutbox() {
-        let inFlight = Set(WCSession.default.outstandingFileTransfers.map(\.file.fileURL.lastPathComponent))
+    private func clearOutbox() async {
+        let inFlight = await WCTransfers.read {
+            Set(WCSession.default.outstandingFileTransfers.map(\.file.fileURL.lastPathComponent))
+        }
         let files = (try? FileManager.default.contentsOfDirectory(at: outbox, includingPropertiesForKeys: nil)) ?? []
         for file in files where !inFlight.contains(file.lastPathComponent) {
             try? FileManager.default.removeItem(at: file)
@@ -373,19 +402,19 @@ actor UntetheredLineLog {
     func flushIfNeeded(force: Bool = false) async {
         let due = force || Date().timeIntervalSince(lastFlush) >= flushInterval || outboxLines >= flushSizeThreshold
         guard due, session.activationState == .activated, session.isReachable else { return }
-        send(queued: false)
+        await send(queued: false)
     }
 
     /// Sends everything not yet confirmed; `queued` hands it to WatchConnectivity's queue even with the phone in
     /// reach (a background moment, where an interactive message may not get its answer).
     func flushPersistedLogs(queued: Bool = false) async {
-        send(queued: queued)
+        await send(queued: queued)
     }
 
     /// WatchConnectivity reported a failed transfer: what isn't confirmed is sent again once the phone is in reach.
     func transferFailed() async {
         guard session.isReachable else { return }
-        send(queued: false)
+        await send(queued: false)
     }
 
     /// The phone has these parts.
@@ -466,8 +495,11 @@ actor UntetheredLineLog {
 
     /// Sent parts the phone hasn't confirmed, that WatchConnectivity no longer holds, and that went out over
     /// `resendAfter` ago (a dropped queue, a failed transfer, a lost answer) become pending again.
-    private func recoverUnconfirmed() {
-        let queued = Set(session.outstandingUserInfoTransfers.compactMap { $0.userInfo[Self.idKey] as? String })
+    private func recoverUnconfirmed() async {
+        let key = Self.idKey
+        let queued = await WCTransfers.read {
+            Set(WCSession.default.outstandingUserInfoTransfers.compactMap { $0.userInfo[key] as? String })
+        }
         let cutoff = Date().addingTimeInterval(-resendAfter)
         for url in files(in: sentDir) {
             let id = url.deletingPathExtension().lastPathComponent
@@ -486,14 +518,14 @@ actor UntetheredLineLog {
 
     // MARK: - Sending
 
-    private func send(queued: Bool) {
+    private func send(queued: Bool) async {
         if session.activationState != .activated {
             session.activate()
             return
         }
         sealOutbox()
         prune()
-        if session.isReachable { recoverUnconfirmed() }
+        if session.isReachable { await recoverUnconfirmed() }
         lastFlush = Date()
 
         for url in files(in: pendingDir) {

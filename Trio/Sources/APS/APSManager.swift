@@ -681,6 +681,7 @@ final class BaseAPSManager: APSManager, Injectable {
 
         do {
             try await pump.enactBolus(units: roundedAmount, automatic: isSMB)
+            PhoneLastDose.note()
             info(.bolus, "Bolus enacted: \(roundedAmount) U, \(isSMB ? "automatic" : "manual")")
             bolusProgress.send(0)
             callback?(true, String(localized: "Bolus enacted successfully.", comment: "Success message for enacting a bolus"))
@@ -815,12 +816,14 @@ final class BaseAPSManager: APSManager, Injectable {
 
         if let rate = rateDecimal, let duration = durationInSeconds {
             try await performBasal(pump: pump, rate: rate, duration: duration)
+            PhoneLastDose.note()
             info(.loop, "Temp basal enacted: \(rate) U/h for \(Int(duration / 60)) min")
         }
 
         // only perform a bolus if smbToDeliver is > 0
         if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending {
             try await performBolus(pump: pump, smbToDeliver: smb)
+            PhoneLastDose.note()
             info(.loop, "SMB enacted: \(smb) U")
         }
         return true
@@ -1598,5 +1601,23 @@ extension PumpManagerStatus {
         let suspended = basalDeliveryState.map { $0.isSuspended || $0 == .pumpInoperable } ?? true
         let type = suspended ? StatusType.suspended : (bolusing ? .bolusing : .normal)
         return PumpStatus(status: type, bolusing: bolusing, suspended: suspended, timestamp: Date())
+    }
+}
+
+/// When the phone last enacted a dose command on the pod: a temp basal or a bolus, automatic or by hand. Sent to the
+/// watch with its state, where it counts as word from the phone besides its readings: a phone that doses is looping,
+/// even when one of its readings didn't come (8 November, 17:21: the watch looked at the pod a minute after the phone's
+/// bolus, its newest reading being 5.5 minutes old). Pod contact alone doesn't count: a phone without a sensor still
+/// reaches the pod for status reads and heartbeats, and that would keep the watch from taking over from a phone that
+/// can't loop (8 November, 11:48 to 14:06).
+enum PhoneLastDose {
+    private static let key = "untethered.phoneLastDoseDate"
+
+    static var date: Date? {
+        UserDefaults.standard.object(forKey: key) as? Date
+    }
+
+    static func note(_ date: Date = Date()) {
+        UserDefaults.standard.set(date, forKey: key)
     }
 }

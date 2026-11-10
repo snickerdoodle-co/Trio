@@ -57,8 +57,16 @@ struct UntetheredSession: Codable, Equatable {
     }
 
     /// How long the phone keeps offering a start (`prepare`, sent again every few seconds) before it gives up. 15 s
-    /// with a single send failed whenever WatchConnectivity didn't get through at once (25 October: four tries).
-    static let prepareTimeout: TimeInterval = 30
+    /// with a single send failed whenever WatchConnectivity didn't get through at once (25 October: four tries); 30 s
+    /// ran out while the link came and went every few seconds (9 November, second tester: the watch had the offer at
+    /// 26 s, its answer didn't get back in time). The phone keeps the pump and doses meanwhile, and both sides show
+    /// that the start is under way.
+    static let prepareTimeout: TimeInterval = 90
+    /// From the watch's answer to the offer, the watch has this long to reach the pump. Counted from the answer, not
+    /// from the offer: with the offer sent again for up to 90 s (`prepareTimeout`), a lease counted from the first
+    /// offer left an answer that came late less than 30 s for the takeover. The phone sets the deadline once and sends
+    /// it in its commit, so both sides keep the same moment (the clocks of a paired phone and watch agree).
+    static let takeoverLease: TimeInterval = 120
     /// A start without the phone has this long to reach the pump.
     static let takeoverWithoutPhoneLease: TimeInterval = 5 * 60
     /// After the lease the phone asks once whether the watch holds the pump.
@@ -160,6 +168,7 @@ struct UntetheredSession: Codable, Equatable {
 
         case (.preparing, .received(.prepared, _)):
             phase = .starting
+            leaseExpiresAt = now.addingTimeInterval(Self.takeoverLease)
             return [.commit]
 
         case let (.preparing, .received(.rejected(reason), _)):
@@ -270,7 +279,9 @@ struct UntetheredSession: Codable, Equatable {
         case let (_, .received(_, messageEpoch)) where messageEpoch != epoch:
             return []
 
-        case (.preparing, .received(.commit, _)):
+        case let (.preparing, .received(.commit(handover), _)):
+            // the phone's deadline, which it keeps too (a commit from an older phone build has none: the grant's)
+            if let lease = handover.leaseExpiresAt { leaseExpiresAt = lease }
             guard let leaseExpiresAt, now < leaseExpiresAt else {
                 phase = .idle
                 return [.send(.takeoverFailed(reason: String(localized: "The start took too long.")))]
@@ -344,6 +355,11 @@ struct UntetheredSession: Codable, Equatable {
             guard let leaseExpiresAt, now >= leaseExpiresAt else { return [] }
             phase = .idle
             return []
+
+        // The offer ran out here before the commit came: the watch never reached for the pod, and says so, so the
+        // phone takes it back at once instead of waiting out its lease and the ownership question.
+        case (.idle, .received(.commit, _)):
+            return [.send(.takeoverFailed(reason: String(localized: "The start took too long.")))]
 
         case (.starting, .tick):
             guard let leaseExpiresAt, now >= leaseExpiresAt else { return [] }

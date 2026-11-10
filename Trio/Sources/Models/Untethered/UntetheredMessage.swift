@@ -151,6 +151,13 @@ struct UntetheredPodStatus: Codable, Equatable {
 struct UntetheredHandover: Codable, Equatable {
     let pumpConfiguration: Data?
     let tempBasal: UntetheredTempBasal?
+    /// The phone's deadline for the takeover (`UntetheredSession.takeoverLease` from the watch's answer): the watch
+    /// lets go if it hasn't reached the pump by then, and the phone doesn't take it back before then without word from
+    /// the watch. Optional so a commit from an older phone build still reads.
+    var leaseExpiresAt: Date? = nil
+    /// When the phone sent the commit, by its clock: with the deadline, the watch logs how far the two clocks and the
+    /// delivery put it from the phone's view, should a start ever fail at the edge of the lease.
+    var committedAt: Date? = nil
 }
 
 /// A temp basal handed over: the side letting go cancels it, so its record ends where the pod stopped it; the side

@@ -85,6 +85,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     private var openAPS: OpenAPS!
     private var ticker: Timer?
+    /// Trio kept running for the first seconds of the wait for the watch's ownership answer.
+    private var answerWaitTask = UIBackgroundTaskIdentifier.invalid
     private var lastHandledForeignSessionAt: Date?
     private let assembler = UntetheredChunks.Assembler()
     private var endRequestTimer: Timer?
@@ -388,6 +390,40 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     private static let handbackRequestRetryDelay: TimeInterval = 20
     /// The returned pump has answered: what is left is the watch's last records and the audit.
     @Published private(set) var pumpReturnAnswered = false
+    /// Sends of the current start's offer that didn't get through, for the progress the screens show.
+    @Published private(set) var prepareAttempts = 0
+    /// The watch's newest bolus while it still delivers, from its records: a hand-back says it goes on on the pod
+    /// (9 November: a 2 U bolus from the watch, End Untethered Mode, and nothing seemed to happen).
+    @Published private(set) var watchBolus: WatchBolusInFlight?
+
+    struct WatchBolusInFlight: Equatable {
+        let id: String
+        let units: Double
+        let start: Date
+        let end: Date
+
+        /// What is left now, as the pod delivers it evenly; nil once it is over.
+        func left(at now: Date = Date()) -> (units: Double, until: Date)? {
+            guard end > now, end > start else { return nil }
+            let fraction = min(1, end.timeIntervalSince(now) / end.timeIntervalSince(start))
+            return (units * fraction, end)
+        }
+    }
+
+    /// From each pump event the watch sends: a bolus still delivering is noted, its final version clears it.
+    @MainActor private func noteWatchDose(_ dose: DoseEntry?) {
+        guard let dose, dose.type == .bolus, let id = dose.syncIdentifier else { return }
+        if dose.isMutable, dose.endDate > Date() {
+            watchBolus = WatchBolusInFlight(
+                id: id, units: dose.programmedUnits, start: dose.startDate, end: dose.endDate
+            )
+        } else if watchBolus?.id == id {
+            watchBolus = nil
+        }
+    }
+
+    /// What the watch's running bolus has left, for the hand-back.
+    var watchBolusLeft: (units: Double, until: Date)? { watchBolus?.left() }
     /// How long the start waits for the pump to answer.
     private static let pumpCheckTimeout: TimeInterval = 30
 
@@ -415,6 +451,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                 )
             }
             let grant = try await makeGrant(linkedOverrideID: linkedOverrideID)
+            prepareAttempts = 0
             await apply(.start(grant))
             return nil
         } catch {
@@ -424,6 +461,12 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     }
 
     @MainActor func end() async {
+        if let left = watchBolusLeft {
+            info(
+                .watch,
+                "Untethered: hand-back asked while the watch's bolus runs (\(String(format: "%.2f", left.units)) U left until \(left.until)): it goes on on the pod"
+            )
+        }
         await apply(.end)
         // a watch app the system has suspended isn't reachable, and the request (repeated every 30 s) only got through
         // once Trio was in front on the watch (1 November, 11:44 to 11:45:47). Queued as well, it reaches the watch
@@ -656,7 +699,14 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             case let .send(message):
                 deliver(message)
             case .commit:
-                deliver(.commit(await releasePump()))
+                var handover = await releasePump()
+                // the deadline the session set at the watch's answer, the same for both sides
+                handover.leaseExpiresAt = UntetheredGate.state.session.leaseExpiresAt
+                handover.committedAt = Date()
+                if let lease = handover.leaseExpiresAt {
+                    debug(.watch, "Untethered: commit sent, takeover deadline in \(Int(lease.timeIntervalSinceNow)) s")
+                }
+                deliver(.commit(handover))
             case .takePump:
                 takePump()
             case .reconcile:
@@ -711,6 +761,19 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             ticker?.invalidate()
             ticker = nil
         }
+        // The ownership question goes out from a background wake (a reading, a refused pod command), and the watch's
+        // answer, queued when the phone is out of reach for that moment, is delivered only while Trio runs: on
+        // 9 November (second tester) Trio went back to sleep 4 s after asking at 10:40:03 and held its dosing until
+        // it was opened at 10:48. Kept running for the seconds the system gives, which an answer usually needs.
+        if state.session.isCheckingForeignSession {
+            if answerWaitTask == .invalid {
+                answerWaitTask = UIApplication.shared.beginBackgroundTask(withName: "Untethered ownership answer") {
+                    [weak self] in self?.endAnswerWait()
+                }
+            }
+        } else {
+            endAnswerWait()
+        }
         if phase == .ending {
             // repeated until the watch hands back; it may be reachable without a reachability change
             if endRequestTimer == nil {
@@ -725,6 +788,12 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             endRequestTimer = nil
         }
         Task { await scheduleLinkedOverrideCheck() }
+    }
+
+    @MainActor private func endAnswerWait() {
+        guard answerWaitTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(answerWaitTask)
+        answerWaitTask = .invalid
     }
 
     /// The ticker is a timer, and a timer stands still while Trio is in the background: the wait for the watch's answer
@@ -784,7 +853,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             // the tick ends the start with "the watch did not answer"
             return
         }
-        debug(.watch, "Untethered: the start didn't reach the watch (\(why)), trying again")
+        prepareAttempts += 1
+        debug(.watch, "Untethered: the start didn't reach the watch (\(why)), trying again (\(prepareAttempts + 1). try)")
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.prepareRetryDelay) { [weak self] in
             guard let self, self.state.session.phase == .preparing, self.state.session.epoch == epoch else { return }
             self.send(message, epoch: epoch)
@@ -1663,7 +1733,10 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         for record in run {
             switch record.kind {
             case let .glucose(reading): glucose.append(reading)
-            case let .pumpEvent(data): events.append(try Self.pumpEvent(from: data))
+            case let .pumpEvent(data):
+                let event = try Self.pumpEvent(from: data)
+                await MainActor.run { self.noteWatchDose(event.dose) }
+                events.append(event)
             default: break
             }
         }
@@ -1695,6 +1768,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         switch record.kind {
         case let .pumpEvent(data):
             let event = try Self.pumpEvent(from: data)
+            await MainActor.run { self.noteWatchDose(event.dose) }
             // held before the row exists, so no purge can fall in between; released once the row is final
             let pendingDose = event.dose?.syncIdentifier.flatMap { $0.isEmpty ? nil : $0 }
             if let pendingDose, event.dose?.isMutable == true {

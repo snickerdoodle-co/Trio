@@ -1901,6 +1901,8 @@ extension UntetheredWatchManager: CGMManagerDelegate {
             direction: BloodGlucose.Direction(rawValue: payload["direction"] as? String ?? "") ?? .none
         )
         DispatchQueue.main.async {
+            // the phone's own reading: the hand-back to a phone that reads again goes by it (`phoneCanLoop`)
+            WatchG7Reader.shared.notePhoneOwnReading(reading.date)
             guard reading.date > (self.pendingPhoneReading?.date ?? .distantPast) else { return }
             self.pendingPhoneReading = reading
             self.takePendingPhoneReading()

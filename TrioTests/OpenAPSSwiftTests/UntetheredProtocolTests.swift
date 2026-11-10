@@ -31,12 +31,13 @@ import Testing
         var phone = UntetheredSession()
         var watch = UntetheredSession()
 
-        // the first start: the phone asks after the lease, then hears the takeover failed
+        // the first start: the phone asks after the lease (from the watch's answer), then hears the takeover failed
         _ = phone.phone(.start(base.grant(lease: 60)), now: t0)
         let firstEpoch = phone.epoch
         _ = phone.phone(.received(.prepared, epoch: firstEpoch), now: t0)
-        #expect(phone.phone(.tick, now: t0 + 71) == [.send(.statusQuery)])
-        _ = phone.phone(.received(.takeoverFailed(reason: "pod"), epoch: firstEpoch), now: t0 + 72)
+        let asked = t0 + UntetheredSession.takeoverLease + UntetheredSession.statusQueryGrace + 1
+        #expect(phone.phone(.tick, now: asked) == [.send(.statusQuery)])
+        _ = phone.phone(.received(.takeoverFailed(reason: "pod"), epoch: firstEpoch), now: asked + 1)
         #expect(phone.isIdle)
 
         // a second start, five minutes later
@@ -70,8 +71,10 @@ import Testing
         var phone = UntetheredSession()
         _ = phone.phone(.start(base.grant(lease: 60)), now: t0)
         _ = phone.phone(.received(.prepared, epoch: phone.epoch), now: t0)
-        #expect(phone.phone(.tick, now: t0 + 71) == [.send(.statusQuery)])
-        let effects = phone.phone(.received(.statusReport(holding: nil), epoch: phone.epoch), now: t0 + 72)
+        // the lease runs from the watch's answer, not from the grant
+        let asked = t0 + UntetheredSession.takeoverLease + UntetheredSession.statusQueryGrace + 1
+        #expect(phone.phone(.tick, now: asked) == [.send(.statusQuery)])
+        let effects = phone.phone(.received(.statusReport(holding: nil), epoch: phone.epoch), now: asked + 1)
         #expect(effects.first == .takePump)
         #expect(phone.isIdle)
     }

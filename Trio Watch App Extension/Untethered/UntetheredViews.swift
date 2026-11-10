@@ -29,7 +29,8 @@ struct UntetheredStatusView: View {
     private var isPhoneReachable: Bool { WatchState.shared.isReachable }
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
+        // by the second while a start is under way, so its seconds count up
+        TimelineView(.periodic(from: .now, by: phase == .preparing || phase == .starting ? 1 : 30)) { context in
             ScrollView {
                 VStack(spacing: 10) {
                     header(now: context.date)
@@ -164,7 +165,8 @@ struct UntetheredStatusView: View {
 
     /// The phone didn't take the last message, or isn't in reach right now.
     private func phoneSeemsBusy(now: Date) -> Bool {
-        !WCSession.default.isReachable || manager.phoneTroubleAt.map { now.timeIntervalSince($0) < 2 * 60 } ?? false
+        // the cached reachability: asked of WatchConnectivity while the screen is drawn, a stall there hangs it (`WCTransfers`)
+        !WatchState.shared.isReachable || manager.phoneTroubleAt.map { now.timeIntervalSince($0) < 2 * 60 } ?? false
     }
 
     private func look(now: Date) -> (symbol: String, tint: Color, title: LocalizedStringKey, subtitle: LocalizedStringKey) {
@@ -194,11 +196,17 @@ struct UntetheredStatusView: View {
             if data.session.startedWithoutPhone {
                 return ("applewatch.radiowaves.left.and.right", .yellow, "Starting…", "Looking for the pod")
             }
+            // the start goes on for up to 90 s while the link comes and goes: shown as it runs, so nobody taps again
+            let seconds = Int(waited)
             if waited > 20, phoneSeemsBusy(now: now) {
-                return ("hourglass", .orange, "iPhone Busy",
-                        "The iPhone hasn't answered yet. Open Trio on the iPhone; the start goes on by itself")
+                return ("hourglass", .orange, "Reaching the iPhone… \(seconds) s",
+                        "Keep Trio open here and on the iPhone; the start goes on by itself for up to 1½ minutes")
             }
-            return ("applewatch.radiowaves.left.and.right", .yellow, "Starting…", "Taking over the pump and sensor")
+            if phase == .preparing {
+                return ("applewatch.radiowaves.left.and.right", .yellow, "Starting… \(seconds) s",
+                        "Agreeing with the iPhone. Keep Trio open; the iPhone doses until the watch has the pump")
+            }
+            return ("applewatch.radiowaves.left.and.right", .yellow, "Starting… \(seconds) s", "Taking over the pump and sensor")
         case .ending:
             let waited = now.timeIntervalSince(manager.phaseSince)
             if unsynced > 0 {
@@ -392,9 +400,8 @@ struct UntetheredStatusView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
-                .disabled(manager.isBolusing)
                 if manager.isBolusing {
-                    note("A bolus is running. Hand back once it is done, or stop it with the treatment button.")
+                    note("A bolus is running. It goes on after the hand-back; to stop it, use the treatment button first.")
                 }
                 stopButton
                 // an alarming pod goes quiet when deactivated; the phone pairs the next one

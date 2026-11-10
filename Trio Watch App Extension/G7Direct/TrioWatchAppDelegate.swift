@@ -167,10 +167,30 @@ final class TrioWatchAppDelegate: NSObject, WKApplicationDelegate {
         task.setTaskCompletedWithSnapshot(false)
     }
 
+    /// watchOS gives this wake 15 s of wall clock and ends Trio past it ("WatchConnectivity watchdog transgression",
+    /// 8 November 17:46, first tester: launched for it, killed 15.3 s later with content still pending). Up to 15 checks a
+    /// second apart reached exactly that. Now it lets go after 10 s at most, and at once when the system ends it
+    /// early; what is still pending comes with the next wake.
+    private static let connectivityHold: TimeInterval = 10
+
     private func completeWhenConnectivityIsDelivered(_ task: WKWatchConnectivityRefreshBackgroundTask, attempt: Int) {
+        if attempt == 0 {
+            task.expirationHandler = { [weak self, weak task] in
+                let expire = {
+                    Task { await WatchLogger.shared.log("⌚️ Connectivity wake expired by the system", force: true) }
+                    if let task { self?.completeOnce(task) }
+                }
+                if Thread.isMainThread { expire() } else { DispatchQueue.main.async(execute: expire) }
+            }
+        }
         let session = WCSession.default
-        if session.activationState != .activated || !session.hasContentPending || attempt >= 15 {
-            task.setTaskCompletedWithSnapshot(false)
+        if session.activationState != .activated || !session.hasContentPending
+            || TimeInterval(attempt) >= Self.connectivityHold
+        {
+            if session.hasContentPending {
+                Task { await WatchLogger.shared.log("⌚️ Connectivity wake let go after \(attempt) s with content still pending", force: true) }
+            }
+            completeOnce(task)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in

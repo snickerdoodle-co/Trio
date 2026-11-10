@@ -173,18 +173,63 @@ import Testing
         var phone = UntetheredSession()
         _ = phone.phone(.start(grant(lease: 60)), now: t0)
         _ = phone.phone(.received(.prepared, epoch: phone.epoch), now: t0)
-        #expect(phone.phone(.tick, now: t0 + 65) == [])
-        #expect(phone.phone(.tick, now: t0 + 71) == [.send(.statusQuery)])
-        #expect(phone.phone(.tick, now: t0 + 90) == [])
+        // the lease runs from the watch's answer, not from the grant
+        #expect(phone.leaseExpiresAt == t0 + UntetheredSession.takeoverLease)
+        #expect(phone.phone(.tick, now: t0 + 125) == [])
+        #expect(phone.phone(.tick, now: t0 + 131) == [.send(.statusQuery)])
+        #expect(phone.phone(.tick, now: t0 + 150) == [])
         #expect(phone.phase == .starting)
 
         var holding = phone
-        _ = holding.phone(.received(.statusReport(holding: podStatus), epoch: phone.epoch), now: t0 + 91)
+        _ = holding.phone(.received(.statusReport(holding: podStatus), epoch: phone.epoch), now: t0 + 151)
         #expect(holding.phase == .active)
 
         var notHolding = phone
-        #expect(notHolding.phone(.received(.statusReport(holding: nil), epoch: phone.epoch), now: t0 + 91).first == .takePump)
+        #expect(notHolding.phone(.received(.statusReport(holding: nil), epoch: phone.epoch), now: t0 + 151).first == .takePump)
         #expect(notHolding.phase == .idle)
+    }
+
+    @Test("start: an answer late in the offer gets the full lease, the same on both sides") func lateAnswerLease() {
+        var phone = UntetheredSession()
+        var watch = UntetheredSession()
+        let grant = grant()
+        _ = phone.phone(.start(grant), now: t0)
+        let epoch = phone.epoch
+        // the offer got through only at 85 s
+        #expect(watch.watch(.received(.prepare(grant), epoch: epoch), now: t0 + 85) == [.send(.prepared)])
+        #expect(phone.phone(.received(.prepared, epoch: epoch), now: t0 + 86) == [.commit])
+        let lease = t0 + 86 + UntetheredSession.takeoverLease
+        #expect(phone.leaseExpiresAt == lease)
+        var commit = handover
+        commit.leaseExpiresAt = phone.leaseExpiresAt
+        #expect(watch.watch(.received(.commit(commit), epoch: epoch), now: t0 + 88) == [.takeover])
+        #expect(watch.leaseExpiresAt == lease)
+        // past the grant's 120 s, within the commit's lease: the takeover counts
+        #expect(watch.watch(.takeoverSucceeded(podStatus), now: t0 + 150) == [.send(.takeoverComplete(podStatus))])
+        // the phone takes nothing back before the lease, whatever its ticks
+        for second in stride(from: 87.0, to: 86 + UntetheredSession.takeoverLease, by: 10) {
+            #expect(!phone.phone(.tick, now: t0 + second).contains(.takePump))
+        }
+        #expect(phone.phone(.received(.takeoverComplete(podStatus), epoch: epoch), now: t0 + 151) == [])
+        #expect(phone.phase == .active)
+    }
+
+    @Test("start: a commit after the watch gave up the offer is answered, and the phone takes the pump back at once") func commitAfterOfferRanOut() {
+        var phone = UntetheredSession()
+        var watch = UntetheredSession()
+        let grant = grant(lease: 60)
+        _ = phone.phone(.start(grant), now: t0)
+        let epoch = phone.epoch
+        _ = watch.watch(.received(.prepare(grant), epoch: epoch), now: t0 + 50)
+        #expect(watch.watch(.tick, now: t0 + 61) == [])
+        #expect(watch.phase == .idle)
+        _ = phone.phone(.received(.prepared, epoch: epoch), now: t0 + 55)
+        let effects = watch.watch(.received(.commit(handover), epoch: epoch), now: t0 + 62)
+        #expect(!effects.contains(.takeover))
+        guard case let .send(failure) = effects.first else { Issue.record("no answer")
+            return }
+        #expect(phone.phone(.received(failure, epoch: epoch), now: t0 + 62).first == .takePump)
+        #expect(phone.phase == .idle)
     }
 
     @Test("messages for another epoch are ignored") func wrongEpoch() {
