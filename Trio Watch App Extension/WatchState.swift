@@ -57,6 +57,14 @@ import WatchKit
     var proteinAmount: Int = 0
     var bolusAmount: Double = 0.0
     var confirmationProgress: Double = 0.0
+    /// Last time the user opened or changed a carbs/bolus entry; nil when no entry is in progress
+    @ObservationIgnored private(set) var entryEditedAt: Date?
+    /// An entry left alone for longer than this is cleared and never sent
+    static let entryLifetime: TimeInterval = 2 * 60
+    static let entryExpiredMessage = String(
+        localized: "Entry expired after 2 minutes. Nothing was sent. Please enter it again.",
+        comment: "Watch message when a carbs or bolus entry was too old to send"
+    )
 
     // Safety limits
     var maxBolus: Decimal = 10
@@ -228,16 +236,56 @@ import WatchKit
             if !showsUnreliableG7 {
                 unsureGlucoseMgdl = nil
                 unsureGlucoseDate = nil
+                unsureGlucoseHistory = []
             }
         }
     }
 
     func noteUnsureGlucose(mgdl: Int, date: Date) {
         DispatchQueue.main.async {
-            guard self.showsUnreliableG7, date > (self.unsureGlucoseDate ?? .distantPast) else { return }
+            guard self.showsUnreliableG7 else { return }
+            self.addUnsureGlucose([(date: date, mgdl: mgdl)])
+            guard date > (self.unsureGlucoseDate ?? .distantPast) else { return }
             self.unsureGlucoseMgdl = mgdl
             self.unsureGlucoseDate = date
         }
+    }
+
+    /// The flagged readings of the last 24 h, oldest first, from the phone, the watch's own reader or untethered
+    /// mode: the chart's hollow orange dots. Kept across relaunches.
+    var unsureGlucoseHistory: [(date: Date, mgdl: Int)] = WatchState.loadUnsureGlucoseHistory() {
+        didSet {
+            let saved = unsureGlucoseHistory.map { [$0.date.timeIntervalSince1970, Double($0.mgdl)] }
+            UserDefaults.standard.set(saved, forKey: Self.unsureGlucoseHistoryKey)
+        }
+    }
+
+    private static let unsureGlucoseHistoryKey = "unsureGlucoseHistory"
+
+    private static func loadUnsureGlucoseHistory() -> [(date: Date, mgdl: Int)] {
+        guard UserDefaults.standard.bool(forKey: WatchMessageKeys.showUnreliableG7),
+              let saved = UserDefaults.standard.array(forKey: unsureGlucoseHistoryKey) as? [[Double]]
+        else { return [] }
+        let now = Date()
+        return saved.compactMap { pair -> (date: Date, mgdl: Int)? in
+            guard pair.count == 2 else { return nil }
+            let date = Date(timeIntervalSince1970: pair[0])
+            return now.timeIntervalSince(date) < 24 * 60 * 60 ? (date: date, mgdl: Int(pair[1])) : nil
+        }
+    }
+
+    /// Adds readings not already there within a minute; drops those older than 24 h. On the main queue.
+    private func addUnsureGlucose(_ new: [(date: Date, mgdl: Int)]) {
+        let now = Date()
+        var merged = unsureGlucoseHistory.filter { now.timeIntervalSince($0.date) < 24 * 60 * 60 }
+        for reading in new where now.timeIntervalSince(reading.date) < 24 * 60 * 60 {
+            guard !merged.contains(where: { abs($0.date.timeIntervalSince(reading.date)) < 60 }) else { continue }
+            merged.append(reading)
+        }
+        merged.sort { $0.date < $1.date }
+        guard merged.count != unsureGlucoseHistory.count || merged.last?.date != unsureGlucoseHistory.last?.date
+        else { return }
+        unsureGlucoseHistory = merged
     }
 
     /// Kept, so the lines and the time-in-range bar stay while the phone is away and after a relaunch.
@@ -263,6 +311,22 @@ import WatchKit
     var acknowledgementStatus: AcknowledgementStatus = .pending
     var acknowledgmentMessage: String = ""
     var shouldNavigateToRoot: Bool = true
+    @ObservationIgnored private var acknowledgmentTimeoutWorkItem: DispatchWorkItem?
+
+    /// Long enough for a pump to accept a bolus, short enough that the user isn't left guessing
+    static let acknowledgmentTimeout: TimeInterval = 15
+    static let noAnswerMessage = String(
+        localized: "No answer from iPhone. Check Trio on your iPhone before trying again.",
+        comment: "Watch message when the phone did not confirm a request"
+    )
+    static let phoneUnreachableMessage = String(
+        localized: "iPhone not reachable. Nothing was sent.",
+        comment: "Watch message when a request could not be sent to the phone"
+    )
+    static let invalidBolusAmountMessage = String(
+        localized: "Error! Bolus amount must be greater than 0 U.",
+        comment: "Error message when a bolus of zero or less is requested"
+    )
 
     // Bolus calculation progress
     var showBolusCalculationProgress: Bool = false
@@ -309,9 +373,73 @@ import WatchKit
         }
     }
 
+    // MARK: - Entry lifetime
+
+    /// Starts or restarts the entry's clock. Call when an input screen appears and on every amount change.
+    func markEntryEdited(at now: Date = Date()) {
+        entryEditedAt = now
+    }
+
+    /// True only for an entry changed within `entryLifetime`; an entry with no recorded edit is never fresh
+    func isEntryFresh(at now: Date = Date()) -> Bool {
+        guard let entryEditedAt else { return false }
+        return now.timeIntervalSince(entryEditedAt) <= Self.entryLifetime
+    }
+
+    /// Ends the entry: clears amounts, the recommendation and the confirmation progress
+    func clearEntry() {
+        bolusAmount = 0
+        carbsAmount = 0
+        fatAmount = 0
+        proteinAmount = 0
+        recommendedBolus = 0
+        confirmationProgress = 0
+        mealTimeReminderMinutes = 0
+        entryEditedAt = nil
+    }
+
+    /// Clears an entry older than `entryLifetime`. Returns true when it did, so the caller can
+    /// leave the input screens.
+    @discardableResult func expireStaleEntry(at now: Date = Date()) -> Bool {
+        guard entryEditedAt != nil, !isEntryFresh(at: now) else { return false }
+        WatchLogger.shared.info(.treatments, "Entry older than \(Int(Self.entryLifetime / 60)) min cleared")
+        clearEntry()
+        return true
+    }
+
     // MARK: – Handle Acknowledgement Messages FROM Phone
 
+    /// Shows "Processing…" and starts the clock for the phone's answer
+    func beginAwaitingAcknowledgment(timeout: TimeInterval = WatchState.acknowledgmentTimeout) {
+        acknowledgmentTimeoutWorkItem?.cancel()
+        acknowledgementStatus = .pending
+        showCommsAnimation = true
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.handleMissingAcknowledgment()
+        }
+        acknowledgmentTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: workItem)
+    }
+
+    /// No answer arrived in time, or sending reported an error. Sending can report an error and
+    /// still deliver the request, so this tells the user to check the phone rather than claiming
+    /// the request failed.
+    func handleMissingAcknowledgment() {
+        guard showCommsAnimation else { return }
+        WatchLogger.shared.warning(.treatments, "No answer from the phone for the last request")
+        handleAcknowledgment(success: false, message: Self.noAnswerMessage)
+    }
+
+    /// The request was refused on the watch and never sent
+    func handleRequestNotSent(_ message: String) {
+        handleAcknowledgment(success: false, message: message)
+    }
+
     func handleAcknowledgment(success: Bool, message: String, isFinal: Bool = true) {
+        acknowledgmentTimeoutWorkItem?.cancel()
+        acknowledgmentTimeoutWorkItem = nil
+
         if success {
             acknowledgementStatus = .success
             acknowledgmentMessage = message
@@ -512,24 +640,24 @@ import WatchKit
     /// Called when the reachability status of the paired iPhone changes
     /// Updates the local reachability status
     func sessionReachabilityDidChange(_ session: WCSession) {
+        let isReachable = session.isReachable
         DispatchQueue.main.async {
-            if WatchLogger.shared.shouldLog("reachability", state: "\(session.isReachable)") {
-                WatchLogger.shared.debug(.connectivity, "Phone reachable: \(session.isReachable)")
-            }
+            self.handleReachabilityChange(isReachable: isReachable)
+        }
+    }
 
-            self.isReachable = session.isReachable
-            UntetheredWatchManager.shared.reachabilityChanged()
+    /// Reachability flips on every wrist raise, so this must leave entries in progress alone:
+    /// clearing `bolusAmount` here turned a confirmed bolus into a 0 U request.
+    /// The main view resets the entry fields when it appears.
+    func handleReachabilityChange(isReachable: Bool) {
+        if WatchLogger.shared.shouldLog("reachability", state: "\(isReachable)") {
+            WatchLogger.shared.debug(.connectivity, "Phone reachable: \(isReachable)")
+        }
+        self.isReachable = isReachable
+        UntetheredWatchManager.shared.reachabilityChanged()
 
-            if session.isReachable, !UntetheredWatchManager.shared.isActive {
-                self.forceConditionalWatchStateUpdate()
-
-                // reset input amounts
-                self.bolusAmount = 0
-                self.carbsAmount = 0
-
-                // reset auth progress
-                self.confirmationProgress = 0
-            }
+        if isReachable, !UntetheredWatchManager.shared.isActive {
+            forceConditionalWatchStateUpdate()
         }
     }
 
@@ -718,6 +846,18 @@ import WatchKit
            let mgdl = (message[WatchMessageKeys.unsureGlucoseMgdl] as? NSNumber)?.intValue
         {
             noteUnsureGlucose(mgdl: mgdl, date: Date(timeIntervalSince1970: at))
+        }
+        if let list = message[WatchMessageKeys.unsureGlucoseValues] as? [[String: Any]] {
+            let readings = list.compactMap { entry -> (date: Date, mgdl: Int)? in
+                guard let at = entry["date"] as? TimeInterval,
+                      let mgdl = (entry["mgdl"] as? NSNumber)?.intValue
+                else { return nil }
+                return (date: Date(timeIntervalSince1970: at), mgdl: mgdl)
+            }
+            DispatchQueue.main.async {
+                guard self.showsUnreliableG7 else { return }
+                self.addUnsureGlucose(readings)
+            }
         }
 
         if let minYAxisValue = message[WatchMessageKeys.minYAxisValue] {

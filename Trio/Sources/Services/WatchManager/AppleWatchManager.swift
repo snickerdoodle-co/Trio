@@ -625,11 +625,17 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
             dictionary[WatchMessageKeys.phoneLastDoseDate] = dose.timeIntervalSince1970
         }
         dictionary[WatchMessageKeys.showUnreliableG7] = UnsureGlucoseStore.isEnabled
-        if let unsure = UnsureGlucoseStore.shared.latest,
+        let unsureReadings = UnsureGlucoseStore.shared.snapshot
+        if let unsure = unsureReadings.last,
            Date().timeIntervalSince(unsure.date) < UnsureGlucoseStore.freshFor
         {
             dictionary[WatchMessageKeys.unsureGlucoseMgdl] = unsure.mgdl
             dictionary[WatchMessageKeys.unsureGlucoseDate] = unsure.date.timeIntervalSince1970
+        }
+        if UnsureGlucoseStore.isEnabled {
+            dictionary[WatchMessageKeys.unsureGlucoseValues] = unsureReadings.map {
+                ["mgdl": $0.mgdl, "date": $0.date.timeIntervalSince1970] as [String: Any]
+            }
         }
         dictionary[WatchMessageKeys.remoteControlSecret] = Self.remoteControlSecretForWatch(settingsManager.settings)
 
@@ -694,11 +700,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     private func watchG7Details() -> [String: Any] {
         var details: [String: Any] = [WatchMessageKeys.watchDisplayUnits: settingsManager.settings.units.rawValue]
 
-        // Reading through the Dexcom app, the phone has no code of its own: with Read on Apple Watch on, the code
-        // entered for the watch (Dexcom G7 › Apple Watch) goes, or "" so the watch says it is missing. Before, the
-        // watch's own reader got no sensor at all in that mode (8 November, third tester: "Sensor: –").
         if let g7 = fetchGlucoseManager?.cgmManager as? G7CGMManager,
-           g7.state.sessionMode == .direct || g7.isWatchDirectReadEnabled,
+           g7.state.sessionMode == .direct,
            let sensorName = g7.state.sensorID
         {
             details[WatchMessageKeys.g7DirectSensorName] = sensorName

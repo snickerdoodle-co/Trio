@@ -138,6 +138,18 @@ struct GlucoseChartView: View {
         return glucoseValues.filter { domain.contains($0.date) }
     }
 
+    /// The G7's unreliable readings in the window, in display units: hollow orange dots, never used.
+    private var filteredUnsureValues: [(date: Date, glucose: Double)] {
+        guard state.showsUnreliableG7 else { return [] }
+        let domain = xAxisDomain
+        return state.unsureGlucoseHistory
+            .filter { domain.contains($0.date) }
+            .map { (date: $0.date, glucose: Double($0.mgdl) * displayFactor) }
+    }
+
+    /// A hollow dot as wide as a filled one: symbolSize is an area.
+    private var unsurePointDiameter: CGFloat { (glucosePointSize / .pi).squareRoot() * 2 }
+
     /// The reading nearest the scrub line, within half a reading's spacing either way.
     private var scrubReading: (date: Date, glucose: Double, color: Color)? {
         let marker = scrubDate
@@ -218,6 +230,7 @@ struct GlucoseChartView: View {
 
     private var yAxisBounds: (min: Double, max: Double)? {
         let values = filteredValues.map(\.glucose) +
+            filteredUnsureValues.map(\.glucose) +
             forecastConePoints.flatMap { [$0.min, $0.max] } +
             forecastLinePoints.map(\.value) +
             [lowLine, highLine].compactMap { $0 }
@@ -260,7 +273,7 @@ struct GlucoseChartView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if filteredValues.isEmpty {
+            if filteredValues.isEmpty, filteredUnsureValues.isEmpty {
                 Text("No glucose readings.").font(.headline)
                 Text("Check phone and CGM connectivity.").font(.caption)
             } else {
@@ -295,6 +308,18 @@ struct GlucoseChartView: View {
                         )
                         .foregroundStyle(reading.color)
                         .symbolSize(glucosePointSize)
+                    }
+
+                    ForEach(filteredUnsureValues, id: \.date) { reading in
+                        PointMark(
+                            x: .value("Time", reading.date),
+                            y: .value("Glucose", reading.glucose)
+                        )
+                        .symbol {
+                            Circle()
+                                .strokeBorder(Color.orange, lineWidth: 1)
+                                .frame(width: unsurePointDiameter, height: unsurePointDiameter)
+                        }
                     }
 
                     // untethered mode's own history while it runs, else the phone's

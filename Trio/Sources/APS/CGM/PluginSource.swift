@@ -390,8 +390,14 @@ final class UnsureGlucoseStore: ObservableObject {
     @Published private(set) var readings: [UnsureGlucose] = [] {
         didSet {
             if let data = try? JSONEncoder().encode(readings) { UserDefaults.standard.set(data, forKey: Self.storageKey) }
+            snapshotLock.withLock { snapshotStorage = readings }
         }
     }
+
+    /// The readings for the watch's state, built off the main thread.
+    var snapshot: [UnsureGlucose] { snapshotLock.withLock { snapshotStorage } }
+    private let snapshotLock = NSLock()
+    private var snapshotStorage: [UnsureGlucose] = []
 
     private static let storageKey = "trio.unsureGlucose"
 
@@ -418,6 +424,8 @@ final class UnsureGlucoseStore: ObservableObject {
         {
             let now = Date()
             readings = saved.filter { now.timeIntervalSince($0.date) < Self.keep }
+            // an initializer's own assignment calls no didSet
+            snapshotStorage = readings
         }
     }
 

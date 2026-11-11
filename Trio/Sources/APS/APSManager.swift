@@ -652,7 +652,10 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async {
-        if amount <= 0 {
+        // Answer every caller: a silent return here left the watch waiting on "Processing…" forever
+        guard amount > 0 else {
+            warning(.bolus, "Bolus of \(amount) U not enacted, amount must be above 0")
+            callback?(false, Self.invalidBolusAmountMessage)
             return
         }
 
@@ -677,6 +680,12 @@ final class BaseAPSManager: APSManager, Injectable {
 
         let roundedAmount = pump.roundToSupportedBolusVolume(units: amount)
 
+        guard roundedAmount > 0 else {
+            warning(.bolus, "Bolus of \(amount) U not enacted, rounds to 0 U on this pump")
+            callback?(false, Self.invalidBolusAmountMessage)
+            return
+        }
+
         debug(.bolus, "Enacting bolus \(roundedAmount) U, \(isSMB ? "automatic" : "manual")")
 
         do {
@@ -695,6 +704,30 @@ final class BaseAPSManager: APSManager, Injectable {
         } catch let bolusError {
             error(.bolus, "Bolus of \(roundedAmount) U failed", error: bolusError)
             lastError.send(APSError.pumpError(bolusError))
+            // Refused before anything reached the pod: the watch had just looked at it, which counts as another
+            // controller's session. The phone now asks the watch, and once it answers "not holding" the loop runs
+            // again by itself (10 November, third tester: each refused loop dosed again within 5–8 s). Nothing was
+            // given, so a bolus asked for by hand says that plainly instead of "check pump history"; an SMB says
+            // nothing, as the loop that follows decides afresh.
+            if String(describing: bolusError).contains("Another controller has used this pod") {
+                let message = String(
+                    localized: "Nothing was given: the watch was checking the pod. Please try again in a moment.",
+                    comment: "A bolus refused before it reached the pod, because the watch had just looked at the pod"
+                )
+                if isSMB {
+                    debug(.bolus, "SMB of \(roundedAmount) U refused after the watch's look at the pod; the next loop decides")
+                } else {
+                    issueAlertForCategory(.bolusFailed, title: String(localized: "Bolus not given"), body: message)
+                    let broadcaster = self.broadcaster
+                    Task { @MainActor in
+                        broadcaster?.notify(BolusFailureObserver.self, on: .main) {
+                            $0.bolusDidFail()
+                        }
+                    }
+                }
+                callback?(false, message)
+                return
+            }
             // with the iPhone's Bluetooth off the pump reads as "not connected": say why (28 October, flight mode)
             let bluetoothOff = await MainActor.run { self.bluetoothManager?.bluetoothState == .poweredOff }
             let reason = bluetoothOff
@@ -720,6 +753,11 @@ final class BaseAPSManager: APSManager, Injectable {
             )
         }
     }
+
+    static let invalidBolusAmountMessage = String(
+        localized: "Error! Bolus amount must be greater than 0 U.",
+        comment: "Error message when a bolus of zero or less is requested"
+    )
 
     func cancelBolus(_ callback: ((Bool, String) -> Void)?) async {
         guard let pump = pumpManager, pump.status.pumpStatus.bolusing else { return }

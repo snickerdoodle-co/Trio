@@ -626,7 +626,11 @@ import WatchKit
             noteSessionBattery(started: isActive)
         }
         // the phone may have confirmed the last records while the hand-back was still open: nothing else says so
-        if wasActive, !isActive { finishSyncIfDone(epoch: epoch) }
+        if wasActive, !isActive {
+            finishSyncIfDone(epoch: epoch)
+            // the phone has the pump again: the fallback's next look waits 5 minutes from here
+            WatchG7Reader.shared.notePhoneTookPump()
+        }
         if store.data.session.phase != phaseBefore {
             phaseSince = Date()
             if store.data.session.phase == .idle { podQuietUntil = nil }

@@ -52,12 +52,7 @@ struct BolusConfirmationView: View {
             Spacer()
 
             Button("Cancel") {
-                state.mealTimeReminderMinutes = 0
-                if state.carbsAmount > 0 {
-                    state.carbsAmount = 0 // reset carbs in state
-                }
-                bolusAmount = 0 // reset bolus in state
-                confirmationProgress = 0 // reset auth progress
+                state.clearEntry()
                 navigationPath.removeLast(navigationPath.count)
             }
             .buttonStyle(.bordered)
@@ -81,17 +76,8 @@ struct BolusConfirmationView: View {
                 WKInterfaceDevice.current().play(.success)
 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    // the meal-time reminder set on the bolus page goes with the bolus, for its meal's carbs
-                    let carbs = state.carbsAmount
-                    let remindAfter = carbs > 0 && state.mealTimeReminderEnabled ? state.mealTimeReminderMinutes : 0
-                    state.mealTimeReminderMinutes = 0
-                    if state.carbsAmount > 0 {
-                        state.sendCarbsRequest(state.carbsAmount, Date(), acknowledge: false)
-                        state.carbsAmount = 0 // reset carbs in state
-                    }
-                    state.sendBolusRequest(Decimal(bolusAmount), remindAfter: remindAfter, carbs: carbs)
-                    bolusAmount = 0 // reset bolus in state
-                    confirmationProgress = 0 // reset auth progress
+                    // Sends carbs and bolus, or refuses an entry older than 2 min; either way the entry is cleared
+                    state.sendConfirmedEntry(bolusAmount: bolusAmount)
                     navigationPath.append(NavigationDestinations.acknowledgmentPending)
                 }
             } else if newValue > 0 {

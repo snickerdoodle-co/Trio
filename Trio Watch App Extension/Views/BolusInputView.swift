@@ -173,9 +173,7 @@ struct BolusInputView: View {
 
                     Button(actionButtonLabel) {
                         if isCarbsOnly {
-                            state.sendCarbsRequest(state.carbsAmount, remindAfter: offersReminder ? state.mealTimeReminderMinutes : 0)
-                            state.mealTimeReminderMinutes = 0
-                            state.carbsAmount = 0 // reset carbs in state
+                            state.sendCarbsEntry(state.carbsAmount, remindAfter: offersReminder ? state.mealTimeReminderMinutes : 0)
                             navigationPath.append(NavigationDestinations.acknowledgmentPending)
                         } else {
                             state.bolusAmount = min(bolusAmount, effectiveBolusLimit)
@@ -208,7 +206,10 @@ struct BolusInputView: View {
                     .clipShape(Circle())
             }
         }
+        // The entry's 2 min clock restarts whenever the amount changes, including a recommendation landing
+        .onChange(of: bolusAmount) { state.markEntryEdited() }
         .onAppear {
+            state.markEntryEdited()
             // Set initial bolus amount to recommended value
             // Only do this if user has not updated amount previously, e.g., when navigating to next and then back to this view
             if bolusAmount == 0 {

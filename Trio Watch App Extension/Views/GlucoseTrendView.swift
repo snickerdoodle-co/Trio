@@ -270,6 +270,8 @@ struct GlucoseTrendView: View {
             Text(bottomText)
                 .font(.system(size: minutesAgoFontSize))
                 .fontWidth(isWatchStateDated && directReading == nil ? .expanded : .standard)
+                // "Not reliable · N min" in the warning sign's orange, so it reads as part of the warning
+                .foregroundStyle(unsureReading != nil ? Color.orange : Color.primary)
 
             Spacer()
 

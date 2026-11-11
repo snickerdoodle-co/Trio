@@ -15,7 +15,8 @@ on:
       - feature/untethered-pr-plus-next
       - feature/untethered-pr-plus-next-ns
       - feature/untethered-pr-plus-ns
-      - feature/untethered-pr-plus-ns-snick
+      - feature/untethered-t3
+      - feature/untethered-t3-exposed
     paths:
       - 'Trio/Sources/**'
       - 'TrioTests/OpenAPSSwiftTests/**'

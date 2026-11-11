@@ -4,13 +4,55 @@ import WatchConnectivity
 // MARK: - Send Data to Phone
 
 extension WatchState {
+    /// Sends the entry confirmed with the crown: its carbs, if any, then the bolus.
+    /// Refuses an entry older than `entryLifetime` and clears it instead.
+    func sendConfirmedEntry(bolusAmount amount: Double, at now: Date = Date()) {
+        guard refuseIfExpired(at: now) == false else { return }
+
+        let carbs = carbsAmount
+        let fat = fatAmount
+        let protein = proteinAmount
+        // the meal-time reminder set on the bolus page goes with the bolus, for its meal's carbs
+        let remindAfter = carbs > 0 && mealTimeReminderEnabled ? mealTimeReminderMinutes : 0
+        clearEntry()
+        if carbs > 0 {
+            sendCarbsRequest(carbs, now, fat: fat, protein: protein, acknowledge: false)
+        }
+        sendBolusRequest(Decimal(amount), remindAfter: remindAfter, carbs: carbs)
+    }
+
+    /// Sends a carbs-only entry ("Log Carbs"). Refuses an entry older than `entryLifetime` and clears it instead.
+    /// - Parameter remindAfter: carbs without insulin and a meal-time reminder: a timer from now; 0 none.
+    func sendCarbsEntry(_ amount: Int, remindAfter minutes: Int = 0, at now: Date = Date()) {
+        guard refuseIfExpired(at: now) == false else { return }
+
+        let fat = fatAmount
+        let protein = proteinAmount
+        clearEntry()
+        sendCarbsRequest(amount, now, fat: fat, protein: protein, remindAfter: minutes)
+    }
+
+    private func refuseIfExpired(at now: Date) -> Bool {
+        guard !isEntryFresh(at: now) else { return false }
+        WatchLogger.shared.warning(.treatments, "Entry older than \(Int(Self.entryLifetime / 60)) min not sent")
+        clearEntry()
+        handleRequestNotSent(Self.entryExpiredMessage)
+        return true
+    }
+
     /// Sends a bolus insulin request to the paired iPhone
     /// - Parameters:
     ///   - amount: The insulin amount to be delivered
     ///   - remindAfter: a meal-time reminder this many minutes after the bolus has been delivered; 0 none.
     ///   - carbs: the meal's carbs, for the reminder.
     func sendBolusRequest(_ amount: Decimal, remindAfter minutes: Int = 0, carbs: Int = 0) {
+        guard amount > 0 else {
+            WatchLogger.shared.warning(.bolus, "Bolus of \(amount) U not sent, amount must be above 0")
+            handleRequestNotSent(Self.invalidBolusAmountMessage)
+            return
+        }
         if UntetheredWatchManager.shared.isActive {
+            // the watch doses itself and answers when the pod has; no phone to wait for
             showCommsAnimation = true
             UntetheredWatchManager.shared.bolus(amount) { success, message in
                 DispatchQueue.main.async {
@@ -20,15 +62,7 @@ extension WatchState {
             }
             return
         }
-        guard let session = session, session.isReachable else {
-            WatchLogger.shared.warning(.bolus, "Bolus request not sent, phone unreachable")
-            // said, not left to an empty waiting screen: the bolus was not sent
-            handleAcknowledgment(
-                success: false,
-                message: String(localized: "iPhone not reachable. The bolus was not sent.", comment: "Watch bolus, phone unreachable")
-            )
-            return
-        }
+        guard let session = reachableSession(.bolus, notSentLog: "Bolus request not sent, phone unreachable") else { return }
 
         WatchLogger.shared.info(.bolus, "Bolus of \(amount) U requested")
 
@@ -40,24 +74,27 @@ extension WatchState {
             message[WatchMessageKeys.mealTimeReminderCarbs] = carbs
         }
 
-        session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.bolus, "Sending bolus request failed", error: error)
-        }
-
-        // Display pending communication animation
-        showCommsAnimation = true
+        send(message, on: session, .bolus, failureLog: "Sending bolus request failed")
     }
 
     /// Sends a carbohydrate entry request to the paired iPhone
     /// - Parameters:
     ///   - amount: The amount of carbs in grams
     ///   - date: The timestamp for the carb entry (defaults to current time)
+    ///   - fat, protein: the entry's, taken before it is cleared; nil reads them from the state
     /// - Parameter acknowledge: false when a bolus follows at once; untethered, its answer is the only one, as the
     ///   phone's combo answers once.
     /// - Parameter remindAfter: carbs without insulin and a meal-time reminder: a timer from now; 0 none.
-    func sendCarbsRequest(_ amount: Int, _ date: Date = Date(), acknowledge: Bool = true, remindAfter minutes: Int = 0) {
+    func sendCarbsRequest(
+        _ amount: Int,
+        _ date: Date = Date(),
+        fat: Int? = nil,
+        protein: Int? = nil,
+        acknowledge: Bool = true,
+        remindAfter minutes: Int = 0
+    ) {
         if UntetheredWatchManager.shared.isActive {
-            UntetheredWatchManager.shared.addCarbs(amount, fat: fatAmount, protein: proteinAmount, at: date)
+            UntetheredWatchManager.shared.addCarbs(amount, fat: fat ?? fatAmount, protein: protein ?? proteinAmount, at: date)
             if minutes > 0 { UntetheredWatchManager.shared.remindToEat(after: minutes, bolus: 0) }
             if acknowledge { handleAcknowledgment(success: true, message: String(localized: "Carbs logged on the watch.")) }
             return
@@ -65,12 +102,7 @@ extension WatchState {
         guard let session = session, session.isReachable else {
             WatchLogger.shared.warning(.treatments, "Carbs request not sent, phone unreachable")
             // with a bolus following, its own answer says so
-            if acknowledge {
-                handleAcknowledgment(
-                    success: false,
-                    message: String(localized: "iPhone not reachable. The carbs were not logged.", comment: "Watch carbs, phone unreachable")
-                )
-            }
+            if acknowledge { handleRequestNotSent(Self.phoneUnreachableMessage) }
             return
         }
 
@@ -85,12 +117,14 @@ extension WatchState {
             message[WatchMessageKeys.mealTimeReminderCarbs] = amount
         }
 
-        session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.treatments, "Sending carbs request failed", error: error)
+        guard acknowledge else {
+            // the bolus that follows waits for the phone's one answer
+            session.sendMessage(message, replyHandler: nil) { error in
+                WatchLogger.shared.error(.treatments, "Sending carbs request failed", error: error)
+            }
+            return
         }
-
-        // Display pending communication animation
-        showCommsAnimation = true
+        send(message, on: session, .treatments, failureLog: "Sending carbs request failed")
     }
 
     /// Sends a request to cancel the current override preset to the paired iPhone
@@ -100,23 +134,12 @@ extension WatchState {
             handleAcknowledgment(success: true, message: String(localized: "Override stopped."))
             return
         }
-        guard let session = session, session.isReachable else {
-            WatchLogger.shared.warning(.treatments, "Override cancel not sent, phone unreachable")
-            return
-        }
+        guard let session = reachableSession(.treatments, notSentLog: "Override cancel not sent, phone unreachable")
+        else { return }
 
         WatchLogger.shared.info(.treatments, "Override cancel requested")
 
-        let message: [String: Any] = [
-            WatchMessageKeys.cancelOverride: true
-        ]
-
-        session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.treatments, "Sending override cancel failed", error: error)
-        }
-
-        // Display pending communication animation
-        showCommsAnimation = true
+        send([WatchMessageKeys.cancelOverride: true], on: session, .treatments, failureLog: "Sending override cancel failed")
     }
 
     /// Sends a request to activate an override preset to the paired iPhone
@@ -127,23 +150,17 @@ extension WatchState {
             handleAcknowledgment(success: true, message: String(localized: "Override started."))
             return
         }
-        guard let session = session, session.isReachable else {
-            WatchLogger.shared.warning(.treatments, "Override request not sent, phone unreachable")
-            return
-        }
+        guard let session = reachableSession(.treatments, notSentLog: "Override request not sent, phone unreachable")
+        else { return }
 
         WatchLogger.shared.info(.treatments, "Override preset \(presetName) requested")
 
-        let message: [String: Any] = [
-            WatchMessageKeys.activateOverride: presetName
-        ]
-
-        session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.treatments, "Sending override request failed", error: error)
-        }
-
-        // Display pending communication animation
-        showCommsAnimation = true
+        send(
+            [WatchMessageKeys.activateOverride: presetName],
+            on: session,
+            .treatments,
+            failureLog: "Sending override request failed"
+        )
     }
 
     /// Sends a request to cancel the current temporary target to the paired iPhone
@@ -153,23 +170,17 @@ extension WatchState {
             handleAcknowledgment(success: true, message: String(localized: "Temp target stopped."))
             return
         }
-        guard let session = session, session.isReachable else {
-            WatchLogger.shared.warning(.treatments, "Temp target cancel not sent, phone unreachable")
-            return
-        }
+        guard let session = reachableSession(.treatments, notSentLog: "Temp target cancel not sent, phone unreachable")
+        else { return }
 
         WatchLogger.shared.info(.treatments, "Temp target cancel requested")
 
-        let message: [String: Any] = [
-            WatchMessageKeys.cancelTempTarget: true
-        ]
-
-        session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.treatments, "Sending temp target cancel failed", error: error)
-        }
-
-        // Display pending communication animation
-        showCommsAnimation = true
+        send(
+            [WatchMessageKeys.cancelTempTarget: true],
+            on: session,
+            .treatments,
+            failureLog: "Sending temp target cancel failed"
+        )
     }
 
     /// Sends a request to activate a temporary target preset to the paired iPhone
@@ -180,23 +191,44 @@ extension WatchState {
             handleAcknowledgment(success: true, message: String(localized: "Temp target started."))
             return
         }
-        guard let session = session, session.isReachable else {
-            WatchLogger.shared.warning(.treatments, "Temp target request not sent, phone unreachable")
-            return
-        }
+        guard let session = reachableSession(.treatments, notSentLog: "Temp target request not sent, phone unreachable")
+        else { return }
 
         WatchLogger.shared.info(.treatments, "Temp target preset \(presetName) requested")
 
-        let message: [String: Any] = [
-            WatchMessageKeys.activateTempTarget: presetName
-        ]
+        send(
+            [WatchMessageKeys.activateTempTarget: presetName],
+            on: session,
+            .treatments,
+            failureLog: "Sending temp target request failed"
+        )
+    }
+
+    /// The session when the phone can take a request; otherwise tells the user nothing was sent
+    private func reachableSession(_ category: WatchLogEntry.Category, notSentLog: String) -> WCSession? {
+        guard let session = session, session.isReachable else {
+            WatchLogger.shared.warning(category, notSentLog)
+            handleRequestNotSent(Self.phoneUnreachableMessage)
+            return nil
+        }
+        return session
+    }
+
+    /// Sends a treatment request and waits for the phone's acknowledgment
+    private func send(
+        _ message: [String: Any],
+        on session: WCSession,
+        _ category: WatchLogEntry.Category,
+        failureLog: String
+    ) {
+        beginAwaitingAcknowledgment()
 
         session.sendMessage(message, replyHandler: nil) { error in
-            WatchLogger.shared.error(.treatments, "Sending temp target request failed", error: error)
+            WatchLogger.shared.error(category, failureLog, error: error)
+            DispatchQueue.main.async {
+                self.handleMissingAcknowledgment()
+            }
         }
-
-        // Display pending communication animation
-        showCommsAnimation = true
     }
 
     /// Sends a request to calculate a bolus recommendation based on the current carbs amount
