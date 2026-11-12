@@ -214,7 +214,10 @@ import WatchKit
     /// The phone app's version and build as it last said; kept. The watch app starts no session while it differs
     /// from its own, which is the case for a while after an update, until watchOS has installed the new watch app.
     var phoneAppVersion: String? = UserDefaults.standard.string(forKey: WatchMessageKeys.phoneAppVersion) {
-        didSet { UserDefaults.standard.set(phoneAppVersion, forKey: WatchMessageKeys.phoneAppVersion) }
+        didSet {
+            UserDefaults.standard.set(phoneAppVersion, forKey: WatchMessageKeys.phoneAppVersion)
+            if phoneAppVersion != oldValue { UntetheredWatchManager.shared.notePhoneVersion() }
+        }
     }
 
     // chart lines and markers
@@ -228,7 +231,7 @@ import WatchKit
     var unsureGlucoseMgdl: Int?
     var unsureGlucoseDate: Date?
 
-    /// The phone's "Show Unreliable G7 Readings"; kept, so the watch's own reader and untethered mode follow it
+    /// The phone's "Show Unreliable Sensor Readings"; kept, so the watch's own reader and untethered mode follow it
     /// while the phone is away. Off unless the phone said otherwise.
     var showsUnreliableG7 = UserDefaults.standard.bool(forKey: WatchMessageKeys.showUnreliableG7) {
         didSet {

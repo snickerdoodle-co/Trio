@@ -92,7 +92,7 @@ enum WatchMessageKeys {
     /// The flagged readings of the last 24 h, as [["mgdl": Int, "date": TimeInterval]]: the watch chart's hollow
     /// orange dots.
     static let unsureGlucoseValues = "unsureGlucoseValues"
-    /// Whether the phone's "Show Unreliable G7 Readings" is on: the watch shows its own only then.
+    /// Whether the phone's "Show Unreliable Sensor Readings" is on: the watch shows its own only then.
     static let showUnreliableG7 = "showUnreliableG7"
     /// The watch app's push token, from the watch: the phone uploads it with its own so a remote command can also go
     /// straight to the watch while it has the pump.

@@ -58,9 +58,24 @@ import WatchKit
     var readingsFromPhoneSince: Date?
     /// What the log last said about Start by Itself, so it says it again when it changes.
     @ObservationIgnored var loggedFallbackSetting: Bool?
-    /// The phone's newest reading when the looks found nobody at the pod: while it stays the newest, a start that
-    /// didn't begin or didn't reach the pod is tried again at the next reading without looking again.
+    /// The phone's newest reading when the looks found nobody at the pod: while it stays the newest, the outage's next
+    /// tries count with it. Each try needs its own chain of looks; cleared once the phone was seen at the pod.
     @ObservationIgnored var fallbackDecidedFor: Date?
+    /// The first look of the unbroken chain of looks that found nobody at the pod, and how many there were; nil once
+    /// the phone was seen at the pod or a start began.
+    @ObservationIgnored var fallbackNobodySince: Date?
+    @ObservationIgnored var fallbackNobodyLooks = 0
+    /// When the deciding look let go of the pod: a try going on with that look's manager stops if the pod saw another
+    /// controller since (`takeover(continuing:)`).
+    @ObservationIgnored var fallbackDecidedAt: Date?
+    /// The running try goes on with the deciding look's manager, whose message count is the pod's as of that look.
+    @ObservationIgnored var fallbackTakeoverFromLook = false
+    /// The try was stopped at its first read: the phone had used the pod after the deciding look.
+    @ObservationIgnored var fallbackAbortedForPhone = false
+    /// The manager a look reads the pod with, so the end of its background time can let go of the pod.
+    @ObservationIgnored var lookingPump: (PumpManager & ExclusiveDeviceControl)?
+    /// watchOS ended the look's background time: it stops reading and has let go of the pod.
+    @ObservationIgnored var lookAbandoned = false
     /// When the copy a start without the phone runs on was issued: a newer one from the phone replaces it until the
     /// start has the pod.
     @ObservationIgnored var startCopyIssuedAt: Date?
@@ -287,6 +302,8 @@ import WatchKit
         if let version = envelope.appVersion, WatchState.shared.phoneAppVersion != version {
             WatchState.shared.phoneAppVersion = version
         }
+        // also after a session: the notice waits while the watch has the pump
+        notePhoneVersion()
         switch envelope.message {
         case let .prepare(grant):
             if let reason = UntetheredVersion.mismatch(phone: envelope.appVersion) ?? rejection(of: grant) {
@@ -780,8 +797,10 @@ import WatchKit
            witness.issuedAt != nil, witness.issuedAt == startCopyIssuedAt
         {
             pump = witness.pump
+            fallbackTakeoverFromLook = true
             Task { await WatchLogger.shared.log("⌚️ Untethered: the takeover goes on with the look's pod manager", force: true) }
         } else {
+            fallbackTakeoverFromLook = false
             if let witness, !witness.pump.isControlReleased { witness.pump.releaseControl() }
             // A look's manager is kept between two looks; a start by hand meanwhile made its own beside it, which never
             // reached the pod (3 November, 11:49 and 11:52: a minute after the 11:48 look, both starts timed out and
@@ -1078,6 +1097,7 @@ import WatchKit
                 if let status = await self.readPump(pump) {
                     // a read that outlasted its try (the lease ran out, a newer try began) doesn't start the next one
                     guard self.data.session.phase == .starting, self.data.session.epoch == epoch else { return }
+                    if self.phoneUsedPodSinceDecision(pump) { return }
                     // the phone's last loop stays on screen; the next CGM reading starts the watch's own
                     self.apply(.takeoverSucceeded(self.startStatus(status, pump: pump)))
                     return
@@ -1263,6 +1283,29 @@ import WatchKit
     /// The phone's build differs from this watch app's: nothing starts until watchOS has updated it (or the phone).
     var versionMismatch: String? {
         UntetheredVersion.mismatch(phone: WatchState.shared.phoneAppVersion ?? UntetheredVersion.current)
+    }
+
+    private static let updateWaitingNoticeKey = "untethered.updateWaitingFor"
+
+    /// The phone runs a newer build than this watch app: watchOS installs the new watch app only once Trio here is
+    /// closed, which it never is by itself while it reads the sensor. Said once per phone build, and not while the
+    /// watch has the pump (closing Trio then would stop its loop).
+    func notePhoneVersion() {
+        guard let phone = WatchState.shared.phoneAppVersion,
+              UntetheredVersion.phoneIsNewer(phone: phone, watch: UntetheredVersion.current),
+              data.session.phase == .idle,
+              UserDefaults.standard.string(forKey: Self.updateWaitingNoticeKey) != phone
+        else { return }
+        UserDefaults.standard.set(phone, forKey: Self.updateWaitingNoticeKey)
+        let watch = UntetheredVersion.current ?? "?"
+        Task { await WatchLogger.shared.log("⌚️ Untethered: the iPhone runs \(phone), this watch app \(watch): update waiting", force: true) }
+        notify(
+            id: Self.notificationPrefix + "updateWaiting",
+            title: String(localized: "Update Waiting"),
+            body: String(localized: "Trio on the iPhone has a newer build. The watch installs it only after Trio here is closed.")
+                + " " + UntetheredVersion.closeOnWatch,
+            asksForAction: true
+        )
     }
 
     func requestStart() {
@@ -1836,11 +1879,20 @@ extension Optional {
 /// Elias Maurer's fallback loop (EJM0/Trio feat/direct-to-watch, 84ad4da and 7943e43 to 5444214), built here on
 /// this branch's own parts: the watch reader supplies the readings and Start Without Phone does the start. With
 /// Settings › Apple Watch › Start by Itself When iPhone Stops on (it needs Allow Start Without iPhone), the watch starts
-/// untethered mode by itself once the phone's newest reading is about 10 minutes old, the watch read two of its own, and
-/// nobody used the pod between the watch's two looks at it; once per outage. When the phone is in reach again for a minute, it hands back by itself.
+/// untethered mode by itself once the phone's newest reading is about 15 minutes old, the watch read three of its own, and
+/// nobody used the pod across the watch's three looks at it, about 10 minutes; once per outage. When the phone is in reach
+/// again for a minute, it hands back by itself.
 extension UntetheredWatchManager {
-    /// The start: the phone's newest reading this old, two of the watch's own newer, and the pod's witness agreeing.
-    static let fallbackPhoneSilence: TimeInterval = 9.5 * 60
+    /// The start: the phone's newest reading this old, three of the watch's own newer, and the pod's witness agreeing
+    /// over `fallbackWitnessSpan`. Two looks 5 minutes apart held only the phone loop already known to be missed: on
+    /// 12 November at 07:31 the watch took over beside a looping phone whose 07:26 reading was missed and whose 07:31
+    /// one came 22 s after the watch's (fresh eyes: Claude Fable's review of the same day).
+    static let fallbackPhoneSilence: TimeInterval = 14.5 * 60
+    /// The looks that found nobody must reach back this far: the window then holds a full phone cycle that isn't
+    /// already known to be missed.
+    static let fallbackWitnessSpan: TimeInterval = 9 * 60
+    /// The watch's own readings newer than the phone's newest, for the start.
+    static let fallbackOwnReadings = 3
     /// The first look at the pod: the phone's newest reading this old, one of the watch's own newer.
     static let fallbackProbeAfter: TimeInterval = 4.5 * 60
     /// The second look counts only this long after the first: a phone that loops talks to the pod in between.
@@ -1862,7 +1914,7 @@ extension UntetheredWatchManager {
     private static let fallbackEpochKey = "untethered.fallbackEpoch"
     private static let fallbackTriedForKey = "untethered.fallbackTriedFor"
     private static let fallbackTriesKey = "untethered.fallbackTries"
-    /// Tries per outage, one at a reading of the reader at most: about half an hour.
+    /// Tries per outage, each after its own chain of looks: about an hour and a half.
     static let fallbackTries = 6
     /// How long each try (and each reading during one) holds the app awake for the pod.
     static let fallbackTakeoverHold: TimeInterval = 25
@@ -1914,30 +1966,33 @@ extension UntetheredWatchManager {
             dropFallbackWitness()
             return
         }
-        // the pod already showed nobody since this reading of the phone: try the start again (up to its tries)
-        if fallbackDecidedFor == phoneNewest {
-            dropFallbackWitness()
-            startFallback(phoneNewest: phoneNewest, minutes: Int(silence / 60))
-            return
-        }
+        // A try that didn't reach the pod is tried again only after a look that found nobody since the one before:
+        // starting again on a decision up to 25 minutes old missed a phone that came back meanwhile (Fable, 12 November).
         // The phone's readings reach a sleeping watch late or not at all (28 October: the watch started at 21:58
         // and 20:30 beside a phone that looped every 5 minutes). So the pod decides: a phone that loops makes a
         // session on it every 5 minutes, which the watch's next look at the pod shows. The watch starts only when
         // nobody used the pod between two looks about 5 minutes apart.
         guard !isWitnessingPod, !isMeetingPod else { return }
         isWitnessingPod = true
-        let releaseHold = Self.holdProcess(reason: "Untethered fallback: looking at the pod", upTo: Self.fallbackWitnessHold)
+        let readingAt = readerReadings.max()
+        lookAbandoned = false
+        let releaseHold = Self.holdProcess(
+            reason: "Untethered fallback: looking at the pod",
+            upTo: Self.fallbackWitnessHold,
+            onExpire: { [weak self] in self?.abandonLook() }
+        )
         Task { @MainActor in
             defer {
                 self.isWitnessingPod = false
                 releaseHold()
             }
             try? await Task.sleep(nanoseconds: UInt64(Self.fallbackProbeDelay * 1_000_000_000))
-            // the phone may have been heard meanwhile, or a session begun
-            guard self.data.session.phase == .idle, (WatchG7Reader.shared.phoneLoopSign ?? .distantPast) == phoneNewest
+            // the phone may have been heard meanwhile, been at the pod (a pause), be in reach, or a session begun
+            guard self.data.session.phase == .idle, (WatchG7Reader.shared.phoneLoopSign ?? .distantPast) == phoneNewest,
+                  self.fallbackLooksPaused == nil, !WCSession.default.isReachable, !self.isBusy, !self.lookAbandoned
             else { return }
             let minutes = Int(Date().timeIntervalSince(phoneNewest) / 60)
-            switch await self.lookAtPod() {
+            switch await self.lookAtPod(readingAt: readingAt) {
             case .tooSoon:
                 return
             case let .notReached(reason):
@@ -1945,6 +2000,9 @@ extension UntetheredWatchManager {
                     await WatchLogger.shared.log("⌚️ Untethered: fallback — the watch's look didn't reach the pod (\(reason))", force: true)
                 }
             case .firstLook:
+                // a fresh manager can't vouch for anything before its first look: the chain starts here
+                self.fallbackNobodySince = Date()
+                self.fallbackNobodyLooks = 0
                 Task {
                     await WatchLogger.shared.log(
                         "⌚️ Untethered: fallback — no word from the phone for \(minutes) min, the watch looks at the pod first",
@@ -1953,6 +2011,7 @@ extension UntetheredWatchManager {
                 }
             case let .phoneUsedPod(at):
                 self.dropFallbackWitness()
+                self.fallbackDecidedFor = nil
                 self.fallbackLooksPaused = (phoneNewest, Date().addingTimeInterval(Self.fallbackLookPause))
                 Task {
                     await WatchLogger.shared.log(
@@ -1962,10 +2021,33 @@ extension UntetheredWatchManager {
                     )
                 }
             case .nobody:
-                guard silence > Self.fallbackPhoneSilence, ownNewer >= 2 else { return }
+                let now = Date()
+                self.fallbackNobodyLooks += 1
+                let since = self.fallbackNobodySince ?? now
+                if self.fallbackNobodySince == nil { self.fallbackNobodySince = now }
+                let span = now.timeIntervalSince(since)
+                let silenceNow = now.timeIntervalSince(phoneNewest)
+                let retry = self.fallbackDecidedFor == phoneNewest
+                let chain = "nobody at the pod since \(Self.timeText(since)) (\(self.fallbackNobodyLooks + 1) looks, \(Int(span / 60)) min)"
+                // a retry too: a try that didn't reach the pod may have found the phone holding it (Fable, 12 November)
+                guard silenceNow > Self.fallbackPhoneSilence, ownNewer >= Self.fallbackOwnReadings, span >= Self.fallbackWitnessSpan
+                else {
+                    Task {
+                        await WatchLogger.shared.log(
+                            "⌚️ Untethered: fallback — \(chain), no word from the phone for \(minutes) min: one more look before starting",
+                            force: true
+                        )
+                    }
+                    return
+                }
+                let reader = WatchG7Reader.shared
+                let grantAge = self.standingGrantAge.map { "\(Int($0 / 60)) min" } ?? "none"
                 Task {
                     await WatchLogger.shared.log(
-                        "⌚️ Untethered: fallback — nobody used the pod for \(minutes) min, the phone is gone",
+                        "⌚️ Untethered: fallback — \(chain)\(retry ? ", again after a try that didn't reach it" : ""), " +
+                            "no word from the phone for \(minutes) min (its reading \(reader.phoneGlucoseDate.map(Self.timeText) ?? "none"), " +
+                            "dose \(reader.phoneDoseDate.map(Self.timeText) ?? "none"), in reach \(WCSession.default.isReachable), " +
+                            "copy \(grantAge) old, \(ownNewer) own readings): the phone is gone",
                         force: true
                     )
                 }
@@ -1974,7 +2056,10 @@ extension UntetheredWatchManager {
                 // the takeover's (`takeover`).
                 if let witness = self.fallbackWitness { self.fallbackTakeoverPump = (witness.pump, witness.issuedAt) }
                 self.fallbackWitness = nil
+                self.fallbackNobodySince = nil
+                self.fallbackNobodyLooks = 0
                 self.fallbackDecidedFor = phoneNewest
+                self.fallbackDecidedAt = Date()
                 self.startFallback(phoneNewest: phoneNewest, minutes: minutes)
             }
         }
@@ -1991,7 +2076,7 @@ extension UntetheredWatchManager {
     /// Reads the pod with a manager made from the standing grant, without dosing: the first look keeps the manager,
     /// the second, at least `fallbackWitnessGap` later, reports whether another controller made a session on the
     /// pod since (the pod resynchronizes the session counter, `lastForeignSessionAt`).
-    func lookAtPod() async -> PodLook {
+    func lookAtPod(readingAt: Date? = nil) async -> PodLook {
         let since = fallbackWitness?.at
         if let since, Date().timeIntervalSince(since) < Self.fallbackWitnessGap { return .tooSoon }
         let pump: PumpManager & ExclusiveDeviceControl
@@ -2021,15 +2106,28 @@ extension UntetheredWatchManager {
         }
         // the link takes a few seconds: a single read right after taking control failed at once every time
         // (29 October, 20:28 to 20:53 with the phone in a pot: 6 looks, none reached the pod, no start)
+        lookingPump = pump
+        defer { lookingPump = nil }
         pump.takeControl()
         let started = Date()
         var read: UntetheredPodStatus?
-        while read == nil {
+        var readAt: Date?
+        while read == nil, !lookAbandoned {
             read = await readPump(pump)
-            guard read == nil, Date().timeIntervalSince(started) < Self.fallbackLookPatience else { break }
+            if read != nil { readAt = Date() }
+            guard read == nil, !lookAbandoned, Date().timeIntervalSince(started) < Self.fallbackLookPatience else { break }
             try? await Task.sleep(nanoseconds: Self.takeoverReadInterval)
         }
-        pump.releaseControl()
+        if !pump.isControlReleased { pump.releaseControl() }
+        // laid over the phone's pod slot in the logs: a look in it can keep the phone's loop from the pod
+        let offset = { (date: Date?) -> String in
+            guard let date, let readingAt else { return "?" }
+            return "+\(Int(date.timeIntervalSince(readingAt))) s"
+        }
+        let lookLine = "⌚️ Untethered: fallback look — took the pod \(offset(started)) after the watch's reading, " +
+            "\(readAt != nil ? "read it at \(offset(readAt))" : "no answer"), let go at \(offset(Date()))"
+        Task { await WatchLogger.shared.log(lookLine, force: true) }
+        if lookAbandoned { return .notReached("watchOS ended the background time; the watch let go of the pod") }
         guard read != nil else {
             return .notReached("no answer in \(Int(Date().timeIntervalSince(started))) s")
         }
@@ -2053,9 +2151,9 @@ extension UntetheredWatchManager {
         UserDefaults.standard.set(Date(), forKey: Self.newPodNoticeKey)
         notify(
             id: Self.notificationPrefix + "newPod",
-            title: String(localized: "Watch Doesn't Know the New Pod Yet"),
+            title: String(localized: "Watch Doesn't Know the Pod Yet"),
             body: String(
-                localized: "To take over by itself, the watch has to have reached this pod once. Open Trio on the watch with the iPhone nearby: it looks for the pod by itself."
+                localized: "To take over by itself, the watch has to have reached this pod once: after a pod change, or after Trio was installed again on the watch. Open Trio on the watch with the iPhone nearby: it looks for the pod by itself."
             ),
             asksForAction: true
         )
@@ -2165,15 +2263,58 @@ extension UntetheredWatchManager {
         }
         guard data.session.phase == .idle || message == .revoke else { return }
         dropFallbackWitness()
+        fallbackDecidedFor = nil
         let phoneNewest = WatchG7Reader.shared.phoneLoopSign ?? .distantPast
         fallbackLooksPaused = (phoneNewest, Date().addingTimeInterval(Self.fallbackLookPause))
         Task { await WatchLogger.shared.log("⌚️ Untethered: fallback — the phone was just at the pod, no look for 9 min", force: true) }
     }
 
     func dropFallbackWitness() {
+        fallbackNobodySince = nil
+        fallbackNobodyLooks = 0
         guard let witness = fallbackWitness else { return }
         if !witness.pump.isControlReleased { witness.pump.releaseControl() }
         fallbackWitness = nil
+    }
+
+    /// watchOS ends the look's background time: let go of the pod now, as a suspended look would keep it from the phone
+    /// until the next wake (Fable, 12 November).
+    func abandonLook() {
+        lookAbandoned = true
+        if let pump = lookingPump, !pump.isControlReleased { pump.releaseControl() }
+        Task { await WatchLogger.shared.log("⌚️ Untethered: fallback — watchOS ended the look's background time, the watch let go of the pod", force: true) }
+    }
+
+    /// At a fallback try's first read with the deciding look's manager: the pod resynchronized its message count, so
+    /// another controller (the phone) had a session after the look. The try stops before anything is dosed.
+    func phoneUsedPodSinceDecision(_ pump: PumpManager & ExclusiveDeviceControl) -> Bool {
+        guard isFallbackSession, fallbackTakeoverFromLook, let decidedAt = fallbackDecidedAt else { return false }
+        if let foreign = pump.lastForeignSessionAt, foreign > decidedAt {
+            fallbackAbortedForPhone = true
+            Task {
+                await WatchLogger.shared.log(
+                    "⌚️ Untethered: fallback — the takeover's first read: the pod saw another controller after the deciding look (\(Self.timeText(decidedAt))), the phone is there; stopping before anything is dosed",
+                    force: true
+                )
+            }
+            apply(.takeoverFailed(String(localized: "The iPhone used the pod after the watch decided to take over.")))
+            return true
+        }
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: fallback — the takeover's first read: no other controller at the pod since the deciding look (\(Self.timeText(decidedAt)))",
+                force: true
+            )
+        }
+        return false
+    }
+
+    /// watchOS ends a fallback try's background time before the pod answered: the try lets go of the pod instead of
+    /// keeping it from the phone for its lease; the next reading tries again after a look.
+    func fallbackTakeoverHoldExpired() {
+        guard isFallbackSession, data.session.phase == .starting else { return }
+        Task { await WatchLogger.shared.log("⌚️ Untethered: fallback — watchOS ended the takeover's background time, the watch lets go of the pod", force: true) }
+        apply(.takeoverFailed(String(localized: "watchOS ended the watch's background time before the pod answered.")))
     }
 
     private static func timeText(_ date: Date) -> String {
@@ -2232,11 +2373,17 @@ extension UntetheredWatchManager {
 
     /// Awake for a while, so the takeover's pod reads can run: in the background the app is suspended within seconds.
     @discardableResult private func holdForFallbackTakeover() -> () -> Void {
-        Self.holdProcess(reason: "Untethered fallback: reaching the pod", upTo: Self.fallbackTakeoverHold)
+        Self.holdProcess(
+            reason: "Untethered fallback: reaching the pod",
+            upTo: Self.fallbackTakeoverHold,
+            onExpire: { [weak self] in self?.fallbackTakeoverHoldExpired() }
+        )
     }
 
     private func fallbackTookOver() {
         fallbackGrantCopy = nil
+        fallbackTakeoverFromLook = false
+        fallbackDecidedAt = nil
         // This outage is done: a session ended later, by hand or otherwise, isn't started again until the phone has
         // sent a newer reading (before, the next reading started it again at once while the phone stayed away).
         fallbackDecidedFor = nil
@@ -2267,6 +2414,27 @@ extension UntetheredWatchManager {
 
     /// A try's time ran out without the pod: the next reading tries again, the last one says so.
     private func fallbackTryFailed() {
+        fallbackTakeoverFromLook = false
+        if fallbackAbortedForPhone {
+            fallbackAbortedForPhone = false
+            // the phone is there: this outage is over, and the looks rest as after the phone's ownership question
+            fallbackDecidedFor = nil
+            fallbackDecidedAt = nil
+            // the phone was there: no try used up, so a later real outage still gets all of them
+            let attempt = UserDefaults.standard.integer(forKey: Self.fallbackTriesKey)
+            UserDefaults.standard.set(max(0, attempt - 1), forKey: Self.fallbackTriesKey)
+            if data.standingGrant == nil, let copy = fallbackGrantCopy {
+                store.update {
+                    $0.standingGrant = copy.grant
+                    $0.standingGrantIssuedAt = copy.issuedAt
+                }
+                refresh()
+            }
+            UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.notificationPrefix + "fallback"])
+            let phoneNewest = WatchG7Reader.shared.phoneLoopSign ?? .distantPast
+            fallbackLooksPaused = (phoneNewest, Date().addingTimeInterval(Self.fallbackLookPause))
+            return
+        }
         let attempt = UserDefaults.standard.integer(forKey: Self.fallbackTriesKey)
         Task {
             await WatchLogger.shared.log(

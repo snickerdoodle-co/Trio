@@ -19,7 +19,7 @@ struct GlucoseTrendView: View {
         directReading != nil || state.currentGlucoseIsWatchOwn
     }
 
-    /// A reading the G7 marked unreliable, newer than the reliable one shown and fresh: greyed with a warning sign.
+    /// A reading the sensor marked unreliable, newer than the reliable one shown and fresh: greyed with a warning sign.
     private var unsureReading: (date: Date, mgdl: Int)? {
         guard let date = state.unsureGlucoseDate, let mgdl = state.unsureGlucoseMgdl,
               Date().timeIntervalSince(date) < 12 * 60

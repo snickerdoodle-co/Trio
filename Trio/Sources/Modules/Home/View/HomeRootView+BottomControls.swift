@@ -710,6 +710,7 @@ extension Home.RootView {
             lastGlucoseDate: state.glucoseFromPersistence.last?.date,
             maxIOB: state.maxIOB,
             pendingMealTimeReminder: state.pendingMealTimeReminder,
+            tidepoolLoginRequired: state.tidepoolLoginRequired,
             hasUnacknowledgedReleaseNotes: releaseNotesService.hasUnacknowledgedNotes,
             dosingMode: state.dosingMode,
             untetheredAuditFinding: untetheredAuditFinding,
@@ -825,6 +826,15 @@ extension Home.RootView {
             ) {
                 openMaxIOBSetting()
             }
+        case .tidepoolLoginRequired:
+            panelBanner(
+                systemImage: "icloud.slash.fill",
+                title: String(localized: "Tidepool Login Required"),
+                subtitle: String(localized: "Uploads to Tidepool are paused. Tap to log in."),
+                tint: .orange
+            ) {
+                openTidepoolSetting()
+            }
         case .whatsNew:
             panelBanner(
                 systemImage: "sparkles",
@@ -868,6 +878,11 @@ extension Home.RootView {
             screen: .unitsAndLimits,
             scrollLabel: "Maximum Insulin on Board (IOB)".localized
         ))
+    }
+
+    func openTidepoolSetting() {
+        selectedTab = 3
+        settingsPath.append(SearchResultTarget(screen: .tidepoolConfig, scrollLabel: "Tidepool Integration".localized))
     }
 
     /// Bottom-anchored fixed zone: adjustment/bolus panel above the stats banner.

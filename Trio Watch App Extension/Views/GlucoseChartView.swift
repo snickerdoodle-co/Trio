@@ -138,7 +138,7 @@ struct GlucoseChartView: View {
         return glucoseValues.filter { domain.contains($0.date) }
     }
 
-    /// The G7's unreliable readings in the window, in display units: hollow orange dots, never used.
+    /// The sensor's unreliable readings in the window, in display units: hollow orange dots, never used.
     private var filteredUnsureValues: [(date: Date, glucose: Double)] {
         guard state.showsUnreliableG7 else { return [] }
         let domain = xAxisDomain

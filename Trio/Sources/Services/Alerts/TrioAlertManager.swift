@@ -579,6 +579,10 @@ extension BaseTrioAlertManager: TrioModalAlertResponder, TrioUserNotificationAle
     func requestSnooze(identifier: Alert.Identifier, duration: TimeInterval) {
         // Dismissal is the user's response — full ack (history + device) first.
         handleAcknowledgement(identifier: identifier)
+        // The meal-time reminder is the user's own timer, not an alarm: clearing it snoozes nothing. It is neither a
+        // glucose alarm nor in the catalog, so it fell through to the global snooze below, and an OK on "Time to eat"
+        // silenced every alarm for 15 minutes.
+        guard identifier != .mealTimeReminderEat else { return }
         let untilDate = duration > 0 ? Date().addingTimeInterval(duration) : .distantPast
         if let glucoseType = GlucoseAlertType(slug: identifier.alertIdentifier) {
             broadcaster.notify(GlucoseSnoozeObserver.self, on: .main) { (observer: GlucoseSnoozeObserver) in

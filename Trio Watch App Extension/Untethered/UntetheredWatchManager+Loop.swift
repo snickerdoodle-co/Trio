@@ -819,7 +819,7 @@ extension UntetheredWatchManager {
     }
 
     /// With the fallback on and no session: each word from the phone pushes a warning 25 min out. It comes when the
-    /// phone went silent and the fallback didn't take over by then (it would after about 10 min).
+    /// phone went silent and the fallback didn't take over by then (it would after about 15 min).
     func notePhoneHeardForWarning() {
         let state = WatchState.shared
         guard data.session.phase == .idle, state.fallbackLoop, state.untetheredMode, state.allowUntetheredStartWithoutPhone
@@ -1536,6 +1536,17 @@ extension UntetheredWatchManager: CGMManagerDelegate {
                 let granted = Date().timeIntervalSince(started)
                 let process = ProcessInfo.processInfo
                 let thermal = ["nominal", "fair", "serious", "critical"][min(process.thermalState.rawValue, 3)]
+                // before this handler returns: once it has, watchOS may suspend the app, and a task queued for the main
+                // actor would run only at the next wake, letting go of the pod minutes late (Fable, 12 November).
+                // This runs off the main thread, so waiting for it can't deadlock.
+                if let onExpire {
+                    let done = DispatchSemaphore(value: 0)
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { onExpire() }
+                        done.signal()
+                    }
+                    _ = done.wait(timeout: .now() + 2)
+                }
                 Task { @MainActor in
                     let inFront = WKApplication.shared().applicationState == .active
                     logHold(
@@ -1543,7 +1554,6 @@ extension UntetheredWatchManager: CGMManagerDelegate {
                         after: granted,
                         how: "background time ended by watchOS · lowPower=\(process.isLowPowerModeEnabled) thermal=\(thermal) front=\(inFront)"
                     )
-                    onExpire?()
                 }
             }
         }

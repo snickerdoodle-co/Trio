@@ -439,3 +439,28 @@ import Testing
         #expect(temp.remainingDuration(at: t0, supportedDurations: []) == nil)
     }
 }
+
+/// Which side waits for an update when the two builds differ.
+@Suite("Untethered build check") struct UntetheredBuildCheckTests {
+    @Test("The build number comes from the parentheses") func buildNumber() {
+        #expect(UntetheredVersion.build(of: "1.0.2.69 (760)") == 760)
+        #expect(UntetheredVersion.build(of: "1.0.2.69") == nil)
+        #expect(UntetheredVersion.build(of: nil) == nil)
+    }
+
+    @Test("A newer iPhone build means the watch app waits for its update") func phoneNewer() {
+        #expect(UntetheredVersion.phoneIsNewer(phone: "1.0.2.69 (760)", watch: "1.0.2.67 (741)"))
+        #expect(!UntetheredVersion.phoneIsNewer(phone: "1.0.2.67 (741)", watch: "1.0.2.69 (760)"))
+        #expect(!UntetheredVersion.phoneIsNewer(phone: "1.0.2.69 (760)", watch: "1.0.2.69 (760)"))
+        #expect(!UntetheredVersion.phoneIsNewer(phone: "1.0.2.69 (760)", watch: nil))
+    }
+
+    @Test("Only a watch app behind the iPhone is told to close Trio on the watch") func mismatchText() {
+        let watchBehind = UntetheredVersion.mismatch(phone: "1.0.2.69 (760)", watch: "1.0.2.67 (741)")
+        let phoneBehind = UntetheredVersion.mismatch(phone: "1.0.2.67 (741)", watch: "1.0.2.69 (760)")
+        #expect(watchBehind?.contains(UntetheredVersion.closeOnWatch) == true)
+        #expect(phoneBehind != nil)
+        #expect(phoneBehind?.contains(UntetheredVersion.closeOnWatch) == false)
+        #expect(UntetheredVersion.mismatch(phone: "1.0.2.69 (760)", watch: "1.0.2.69 (760)") == nil)
+    }
+}

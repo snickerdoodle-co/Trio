@@ -374,9 +374,36 @@ enum UntetheredVersion {
     /// build doesn't know its own (tests). A sender without a version is a build from before the check.
     static func mismatch(phone: String?, watch: String?) -> String? {
         guard let phone, let watch, phone != watch else { return nil }
+        if let phoneBuild = build(of: phone), let watchBuild = build(of: watch), watchBuild > phoneBuild {
+            // the iPhone still has the older build: closing Trio on the watch won't help
+            return String(
+                localized: "Trio on the iPhone (\(phone)) and on the watch (\(watch)) are different builds. Install the same build on the iPhone, then start again."
+            )
+        }
         return String(
-            localized: "Trio on the iPhone (\(phone)) and on the watch (\(watch)) are different builds. Wait until the watch app has updated, then start again. To hurry it: Watch app on the iPhone › My Watch › Trio."
+            localized: "Trio on the iPhone (\(phone)) and on the watch (\(watch)) are different builds. Wait until the watch app has updated, then start again. \(closeOnWatch)"
         )
+    }
+
+    /// How to let watchOS install the watch app: it waits while Trio runs there, and Trio on the watch never stops by
+    /// itself while it reads the sensor (third tester, 11 November: the update waited for hours, until Trio was closed).
+    static var closeOnWatch: String {
+        String(
+            localized: "If it doesn't, close Trio on the watch: hold the side button until the power-off screen shows, then hold the Digital Crown until Trio closes. Keep the watch near the iPhone."
+        )
+    }
+
+    /// The build number of "1.0.2.69 (760)"; nil without one.
+    static func build(of version: String?) -> Int? {
+        guard let version, let open = version.lastIndex(of: "("), let close = version.lastIndex(of: ")"), open < close
+        else { return nil }
+        return Int(version[version.index(after: open) ..< close])
+    }
+
+    /// Whether the phone's build is newer than the watch app's: then the watch app waits for watchOS to update it.
+    static func phoneIsNewer(phone: String?, watch: String?) -> Bool {
+        guard let phoneBuild = build(of: phone), let watchBuild = build(of: watch) else { return false }
+        return phoneBuild > watchBuild
     }
 
     /// From the phone's side: the watch's build against this one.

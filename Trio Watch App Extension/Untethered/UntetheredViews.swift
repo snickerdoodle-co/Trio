@@ -360,7 +360,7 @@ struct UntetheredStatusView: View {
             // didn't find the pod in 2 minutes (3 November, 18:04:55; the watch's own search found it in 9 s at 18:11)
             HStack(spacing: 8) {
                 ProgressView().frame(width: 20)
-                Text("Looking for the new pod…").font(.footnote)
+                Text("Looking for the pod…").font(.footnote)
             }
             .padding(.top, 4)
         } else {
@@ -443,12 +443,12 @@ struct UntetheredStatusView: View {
     @ViewBuilder private var copyNote: some View {
         if WatchState.shared.allowUntetheredStartWithoutPhone {
             if manager.standingGrantAge != nil, manager.isMeetingPod {
-                Label("Looking for the new pod…", systemImage: "antenna.radiowaves.left.and.right")
+                Label("Looking for the pod…", systemImage: "antenna.radiowaves.left.and.right")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else if manager.standingGrantAge != nil, manager.standingGrantPodUnknown {
                 Label {
-                    Text("The watch doesn't know the new pod yet, so it can't take over by itself. Keep Trio open here with the iPhone nearby; it looks for the pod.")
+                    Text("The watch doesn't know the pod yet (after a pod change, or after Trio was installed again here), so it can't take over by itself. Keep Trio open here with the iPhone nearby; it looks for the pod.")
                 } icon: {
                     Image(systemName: "exclamationmark.triangle")
                 }

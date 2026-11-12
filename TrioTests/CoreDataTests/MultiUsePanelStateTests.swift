@@ -14,6 +14,7 @@ import Testing
         lastGlucoseDate: Date?,
         maxIOB: Decimal = 10,
         pendingMealTimeReminder: PendingMealTimeReminder? = nil,
+        tidepoolLoginRequired: Bool = false,
         hasUnacknowledgedReleaseNotes: Bool = false,
         dosingMode: DosingMode = .closed,
         untetheredAuditFinding: String? = nil
@@ -24,6 +25,7 @@ import Testing
             lastGlucoseDate: lastGlucoseDate,
             maxIOB: maxIOB,
             pendingMealTimeReminder: pendingMealTimeReminder,
+            tidepoolLoginRequired: tidepoolLoginRequired,
             hasUnacknowledgedReleaseNotes: hasUnacknowledgedReleaseNotes,
             dosingMode: dosingMode,
             untetheredAuditFinding: untetheredAuditFinding,
@@ -169,5 +171,16 @@ import Testing
             lastGlucoseDate: fresh,
             pendingMealTimeReminder: mealTimeReminder
         ) == .notificationsDisabled)
+    }
+
+    @Test("Tidepool login sits between dosing warnings and release notes") func testTidepoolLoginRequired() {
+        #expect(resolve(lastGlucoseDate: fresh, tidepoolLoginRequired: true) == .tidepoolLoginRequired)
+        #expect(resolve(
+            lastGlucoseDate: fresh,
+            tidepoolLoginRequired: true,
+            hasUnacknowledgedReleaseNotes: true
+        ) == .tidepoolLoginRequired)
+        #expect(resolve(lastGlucoseDate: fresh, maxIOB: 0, tidepoolLoginRequired: true) == .maxIOBZero)
+        #expect(resolve(lastGlucoseDate: stale, tidepoolLoginRequired: true) == .cgmStale)
     }
 }
