@@ -76,6 +76,8 @@ import WatchKit
     @ObservationIgnored var lookingPump: (PumpManager & ExclusiveDeviceControl)?
     /// watchOS ended the look's background time: it stops reading and has let go of the pod.
     @ObservationIgnored var lookAbandoned = false
+    /// The copy the fallback last called too old, once its request went out: it says so once per copy.
+    @ObservationIgnored var loggedOldCopyFor: Date?
     /// When the copy a start without the phone runs on was issued: a newer one from the phone replaces it until the
     /// start has the pod.
     @ObservationIgnored var startCopyIssuedAt: Date?
@@ -111,6 +113,9 @@ import WatchKit
     @ObservationIgnored var handbackRequestedAt: Date?
     /// How many Pod Not Reachable notices this stall has brought; from the second on the watch vibrates harder.
     @ObservationIgnored var podLinkNoticeCount = 0
+    /// When loops failed at the pod's link (the pod dropped it, or wasn't reached): two since the last loop shorten
+    /// the wait before the pump goes back to the phone (`podLinkDropLimit`).
+    @ObservationIgnored var podLinkFailures: [Date] = []
     /// When readings arrived during the session, one entry per batch: the pod stall check counts batches that had
     /// their loop, not reading times, as a backfill brings several old readings at once.
     @ObservationIgnored var readingArrivals: [Date] = []
@@ -1145,12 +1150,14 @@ import WatchKit
 
     /// No standing grant young enough to start from, as after a session, whose start dropped it: asked for, as the
     /// phone otherwise sends the next only when something changed or half an hour passed.
-    func requestStandingGrantIfMissing() {
+    /// `force`: one young enough for a start by hand is stored, but too old for the fallback (`fallbackCopyMaxAge`).
+    /// True when a request went out.
+    @discardableResult func requestStandingGrantIfMissing(force: Bool = false) -> Bool {
         let now = Date()
-        guard data.session.phase == .idle, standingGrantAge == nil, WatchState.shared.untetheredMode,
+        guard data.session.phase == .idle, force || standingGrantAge == nil, WatchState.shared.untetheredMode,
               WatchState.shared.allowUntetheredStartWithoutPhone,
               (standingGrantRequestedAt ?? .distantPast).addingTimeInterval(Self.standingGrantRequestInterval) < now
-        else { return }
+        else { return false }
         standingGrantRequestedAt = now
         // queued, so a phone out of reach or asleep answers once it can; only the newest request waits. The list is
         // read off the main thread (`WCTransfers`), and the request sent once the older ones are cancelled.
@@ -1165,6 +1172,7 @@ import WatchKit
                 self.send(.standingGrantRequest, epoch: epoch, queueing: true)
             }
         }
+        return true
     }
 
     /// Why there is no start without the phone, for the status page; nil when one can start.
@@ -1501,7 +1509,22 @@ import WatchKit
                 )
         )
         send(.handbackRequested(minutesWithoutLoop: minutes), epoch: data.session.epoch, queueing: true)
-        holdOffPodForTakeBack()
+        holdOffPodForTakeBack(for: Self.podQuietForHandbackRequest)
+        // A reconnect armed before the request keeps its search for the pod going until a loop gets through, and
+        // with it the pod's one connection the phone needs (Claude Fable's review, 14 November): it ends here.
+        if lastPodLinkReset != nil {
+            lastPodLinkReset = nil
+            pumpManager?.endTakeEscalation()
+        }
+        // If the phone doesn't take the pod in the quiet time (the request is late, or the pod refused it), the
+        // watch is again the only one trying: it reconnects then, rather than at the next notice 5 minutes later.
+        if reason == .podStall {
+            let epoch = data.session.epoch
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.podQuietForHandbackRequest + 1) { [weak self] in
+                guard let self, self.data.session.phase == .active, self.data.session.epoch == epoch else { return }
+                self.reconnectPodIfStalled()
+            }
+        }
     }
 
     /// The phone has used the pod since the watch took it (the pod resynchronized to another controller's newer
@@ -1528,13 +1551,20 @@ import WatchKit
 
     /// The phone reaches for the pod for a few seconds after it gets the request; a loop of the watch's that takes
     /// the pod's link then makes it give up (24 October 13:55: the phone found no link in 5 s, the watch had just
-    /// looped at 13:55:52). A minute without the watch's pod commands, unless the phone refused.
-    func holdOffPodForTakeBack() {
-        podQuietUntil = Date().addingTimeInterval(Self.podQuietForTakeBack)
-        Task { await WatchLogger.shared.log("⌚️ Untethered: leaving the pod to the iPhone for a minute", force: true) }
+    /// looped at 13:55:52). A minute without the watch's pod commands. Ended early when the session ends (the phone has
+    /// the pump).
+    func holdOffPodForTakeBack(for duration: TimeInterval = UntetheredWatchManager.podQuietForTakeBack) {
+        podQuietUntil = Date().addingTimeInterval(duration)
+        let span = duration > Self.podQuietForTakeBack ? "up to \(Int(duration / 60)) minutes" : "a minute"
+        Task { await WatchLogger.shared.log("⌚️ Untethered: leaving the pod to the iPhone for \(span)", force: true) }
     }
 
     static let podQuietForTakeBack: TimeInterval = 60
+    /// After the watch asked to hand back because it can't loop (pod not reached, or no readings): it isn't dosing
+    /// anyway, so it leaves the pod alone until the phone has it, up to this long. A minute wasn't enough: on
+    /// 13 November (third tester) the request reached the phone 4 min 45 s late, the watch was back at the pod by
+    /// then, and the phone found it busy; the pump was back on the phone 25 minutes after the request.
+    static let podQuietForHandbackRequest: TimeInterval = 5 * 60
 
     private func hasUnconfirmedRecords(_ epoch: Int) -> Bool {
         !(store.data.pending[epoch] ?? [:]).isEmpty
@@ -1890,11 +1920,19 @@ extension UntetheredWatchManager {
     static let fallbackPhoneSilence: TimeInterval = 14.5 * 60
     /// The looks that found nobody must reach back this far: the window then holds a full phone cycle that isn't
     /// already known to be missed.
-    static let fallbackWitnessSpan: TimeInterval = 9 * 60
+    /// One window; 4, not 4.5, as a slow first look and a fast second can make it 263 s (Fable, 12 November).
+    static let fallbackWitnessSpan: TimeInterval = 4 * 60
     /// The watch's own readings newer than the phone's newest, for the start.
     static let fallbackOwnReadings = 3
-    /// The first look at the pod: the phone's newest reading this old, one of the watch's own newer.
-    static let fallbackProbeAfter: TimeInterval = 4.5 * 60
+    /// An automatic start only from a copy at most this old when the phone went silent: an older one says
+    /// WatchConnectivity was failing, and a temp target or override the phone set after it isn't in it (Fable,
+    /// 12 November). Measured to the phone's last sign, so the outage itself doesn't age it out. Start Without Phone by
+    /// hand still takes any copy younger than insulin's action time.
+    static let fallbackCopyMaxAge: TimeInterval = 60 * 60
+    /// The first look at the pod: the phone's newest reading this old, one of the watch's own newer. Two looks, not
+    /// three, the first at about 10 minutes; each look costs a looping phone its next pod command.
+    /// The window then is 5 minutes again, so a look in the phone's pod slot weighs more (Fable, 12 November).
+    static let fallbackProbeAfter: TimeInterval = 9.5 * 60
     /// The second look counts only this long after the first: a phone that loops talks to the pod in between.
     static let fallbackWitnessGap: TimeInterval = 3 * 60
     /// Each look waits this long after the reading, so the phone's loop for the same reading is already done.
@@ -1955,6 +1993,28 @@ extension UntetheredWatchManager {
             return
         }
         guard silence > Self.fallbackProbeAfter, ownNewer >= 1 else {
+            dropFallbackWitness()
+            return
+        }
+        if let issuedAt = data.standingGrantIssuedAt, phoneNewest.timeIntervalSince(issuedAt) > Self.fallbackCopyMaxAge {
+            if loggedOldCopyFor != issuedAt, requestStandingGrantIfMissing(force: true) {
+                loggedOldCopyFor = issuedAt
+                let minutes = Int(phoneNewest.timeIntervalSince(issuedAt) / 60)
+                Task {
+                    await WatchLogger.shared.log(
+                        "⌚️ Untethered: fallback — the phone's copy was \(minutes) min old when it went silent, too old to start by itself (asked for a new one)",
+                        force: true
+                    )
+                }
+                notify(
+                    id: Self.notificationPrefix + "oldCopy",
+                    title: String(localized: "Watch Can't Take Over by Itself"),
+                    body: String(
+                        localized: "The iPhone's settings on the watch were over an hour old when the iPhone went silent. Bring the iPhone back, or open Trio on the watch near the pod and tap Start Without Phone."
+                    ),
+                    asksForAction: true
+                )
+            }
             dropFallbackWitness()
             return
         }

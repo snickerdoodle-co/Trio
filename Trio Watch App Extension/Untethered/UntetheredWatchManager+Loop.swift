@@ -191,6 +191,8 @@ extension UntetheredWatchManager {
                 // the pod out of reach: loop again as soon as its link is back, not only at the next reading
                 if enacts, String(describing: error).contains("podNotConnected") || String(describing: error).contains("commsError") {
                     self.podRetryPending = (newestGlucose ?? .distantPast, Date())
+                    self.podLinkFailures.append(Date())
+                    if self.podLinkFailures.count > 12 { self.podLinkFailures.removeFirst(self.podLinkFailures.count - 12) }
                 }
             }
             if !self.loopHoldExpired, self.isActive {
@@ -1775,6 +1777,11 @@ extension UntetheredWatchManager: CGMManagerDelegate {
 
     /// Readings arrive but no loop got through for this long: the pod link is presumed stuck.
     static let podLinkStallLimit: TimeInterval = 15 * 60
+    /// The wait once two loops since the last one failed at the pod's link itself. On the first tester's flight
+    /// (13 November) the pod dropped the watch's link within half a second of each connect for 20 minutes and more,
+    /// while the phone reached it at once; waiting 19–25 minutes didn't bring it back.
+    static let podLinkDropLimit: TimeInterval = 10 * 60
+    static let podLinkDropsForEarlyHandback = 2
     /// At most one reconnect per this interval, so a pod that is really out of reach isn't hammered.
     static let podLinkResetInterval: TimeInterval = 10 * 60
 
@@ -1784,7 +1791,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         checkSensorStall(now: now)
         guard data.session.phase == .active, let pump = pumpManager,
               let lastLoop = loopReference,
-              now.timeIntervalSince(lastLoop) > Self.podLinkStallLimit,
+              now.timeIntervalSince(lastLoop) > podLinkLimit(since: lastLoop),
               now.timeIntervalSince(lastPodLinkNotice ?? .distantPast) > Self.podLinkResetInterval,
               // without readings the sensor is what's missing, and its own alarm says so (2026-10-19 18:04)
               let newest = sensorGlucose.map(\.dateString).max(), now.timeIntervalSince(newest) < 11 * 60,
@@ -1811,9 +1818,24 @@ extension UntetheredWatchManager: CGMManagerDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(tap)) { WKInterfaceDevice.current().play(.failure) }
         }
         Task { await WatchLogger.shared.log("⌚️ Untethered alarm: \(Self.podLinkTitle) after \(minutes) min", force: true) }
+        reconnectPod(pump, minutes: minutes, now: now)
+    }
+
+    /// At the end of the quiet time after a hand-back request, when the phone didn't take the pod: the stall goes on,
+    /// and the reconnect `checkPodLink` held back during the quiet time runs now.
+    func reconnectPodIfStalled(now: Date = Date()) {
+        guard data.session.phase == .active, let pump = pumpManager, let lastLoop = loopReference,
+              now.timeIntervalSince(lastLoop) > podLinkLimit(since: lastLoop)
+        else { return }
+        reconnectPod(pump, minutes: Int(now.timeIntervalSince(lastLoop) / 60), now: now)
+    }
+
+    private func reconnectPod(_ pump: PumpManager & ExclusiveDeviceControl, minutes: Int, now: Date) {
         // The reconnect itself waits for a loop or bolus in flight; the notice above doesn't. A loop waiting on the
         // pod held on for 41 minutes (2026-10-20, 12:20 to 13:01), and nothing else ran for the stall meanwhile.
-        guard !isLooping, !isBolusing,
+        // Not while the phone is taking the pump back: the reconnect's search held the pod's one connection, and the
+        // phone found it busy (13 November, third tester). Without the phone in reach it's the watch's only way.
+        guard !isLooping, !isBolusing, (podQuietUntil ?? .distantPast) <= now,
               now.timeIntervalSince(lastPodLinkReset ?? .distantPast) > Self.podLinkResetInterval
         else { return }
         lastPodLinkReset = now
@@ -1827,6 +1849,15 @@ extension UntetheredWatchManager: CGMManagerDelegate {
             )
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.loopHoldLimit) { releaseHold() }
+    }
+
+    /// How long loops may fail before the pump goes back to the phone: shorter once the pod's link itself failed twice
+    /// since the last loop, as a link that keeps dropping rarely comes back soon. Loops that only missed readings
+    /// keep the longer wait (the readings check above still applies to both).
+    func podLinkLimit(since lastLoop: Date) -> TimeInterval {
+        podLinkFailures.filter { $0 > lastLoop }.count >= Self.podLinkDropsForEarlyHandback
+            ? Self.podLinkDropLimit
+            : Self.podLinkStallLimit
     }
 
     /// Neither a reading nor a loop for this long: the watch's own sensor link isn't working.
@@ -1849,15 +1880,34 @@ extension UntetheredWatchManager: CGMManagerDelegate {
 
     /// A loop reached the pod again: the search an escalation started ends, and so does its notice.
     func podLinkRecovered(_ pump: PumpManager & ExclusiveDeviceControl) {
-        guard lastPodLinkReset != nil || lastPodLinkNotice != nil else { return }
+        guard lastPodLinkReset != nil || lastPodLinkNotice != nil || handbackRequestedAt != nil else { return }
         lastPodLinkNotice = nil
         podLinkNoticeCount = 0
         handbackRequestedAt = nil
+        // a request still queued for the phone would take the pump from a session that loops again
+        Self.cancelQueuedHandbackRequests()
         if lastPodLinkReset != nil {
             lastPodLinkReset = nil
             pump.endTakeEscalation()
         }
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.podLinkID])
+    }
+
+    /// Drops the stall's hand-back requests still waiting in WatchConnectivity's queue, and their notice (Claude
+    /// Fable's review, 14 November). The fallback's hand-back (no minutes) stays: the phone is back, and it should get
+    /// the pump. Off the main thread: reading the transfer list there hung the app (see `WCTransfers`).
+    static func cancelQueuedHandbackRequests() {
+        guard WCSession.isSupported() else { return }
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [notificationPrefix + "handbackRequest"])
+        WCTransfers.run {
+            for transfer in WCSession.default.outstandingUserInfoTransfers {
+                guard let envelope = try? UntetheredEnvelope.decode(transfer.userInfo),
+                      case let .handbackRequested(minutes) = envelope.message, minutes > 0
+                else { continue }
+                transfer.cancel()
+                Task { await WatchLogger.shared.log("⌚️ Untethered: the pod is back, the queued hand-back request is withdrawn", force: true) }
+            }
+        }
     }
 
     static let podLinkID = "untethered.podLink"

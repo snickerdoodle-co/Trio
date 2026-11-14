@@ -388,6 +388,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     /// Take-back tries after a watch's request, and the pause between them.
     private static let handbackRequestTries = 3
     private static let handbackRequestRetryDelay: TimeInterval = 20
+    /// This return's audit ran and found no insulin that no record explains. Only then is a refused bolus tried again.
+    private var auditFoundNoGap = false
     /// The returned pump has answered: what is left is the watch's last records and the audit.
     @Published private(set) var pumpReturnAnswered = false
     /// Sends of the current start's offer that didn't get through, for the progress the screens show.
@@ -663,6 +665,16 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     @MainActor private func apply(_ event: UntetheredSession.PhoneEvent, reply: (([String: Any]) -> Void)? = nil) async {
         let now = Date()
+        // a take-back that ends the check of a foreign session with the watch's "not holding" for the phone's own
+        // session: the watch only looked at the pod. Not a newer epoch's answer, a release, a failed takeover or a
+        // forced take-back: in those the watch may have dosed and replaced the phone's temp (Claude Fable's review,
+        // 14 November).
+        let afterLook: Bool = {
+            guard state.session.isCheckingForeignSession,
+                  case let .received(.statusReport(holding: nil), messageEpoch) = event
+            else { return false }
+            return messageEpoch == state.session.epoch
+        }()
         let (effects, spanEnded, spanStarted) = UntetheredGate.update { state -> ([UntetheredSession.Effect], Bool, Date?) in
             let held = state.session.phase == .active || state.session.phase == .ending
             let effects = state.session.phone(event, now: now)
@@ -708,7 +720,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                 }
                 deliver(.commit(handover))
             case .takePump:
-                takePump()
+                takePump(keepingPhoneDoses: afterLook)
             case .reconcile:
                 UntetheredGate.update { $0.applied[epoch] = $0.applied[epoch] ?? [:] }
                 requestSync(epoch: epoch)
@@ -1210,7 +1222,11 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     // MARK: - Taking the pump back
 
-    @MainActor private func takePump() {
+    /// `keepingPhoneDoses`: the watch only looked at the pod (its answer to a foreign session: not holding). A look
+    /// reads the pod and doses nothing, so the phone's own bolus and temp still in flight stay as programmed. Purged
+    /// as given away instead, the pod's delivered total then booked them as one "untethered gap" bolus at the take-back
+    /// (13 November, third tester: an SMB of 0.35 U and a temp of 1.65 U/h became 0.51 U "no record explains").
+    @MainActor private func takePump(keepingPhoneDoses: Bool = false) {
         UntetheredGate.update {
             $0.pumpReturnPending = true
             // the return's audit judges the session; the gap check starts over after it
@@ -1219,17 +1235,19 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         publish()
         // a silent watch never said what its copy held: before the take-back's pending report, the phone's own doses
         // in flight stay rather than being purged as given away
-        let keepInFlight = state.session.unknownWatchSince != nil
+        let keepInFlight = state.session.unknownWatchSince != nil || keepingPhoneDoses
         Task {
             if keepInFlight { _ = try? await self.pumpHistoryStorage.keepInFlightDoses(startedAfter: nil) }
             (self.apsManager.pumpManager as? ExclusiveDeviceControl)?.takeControl()
-            await self.finishPumpReturn()
+            await self.finishPumpReturn(afterLook: keepingPhoneDoses)
         }
     }
 
     /// Reads the pump until it answers, then audits its delivered total against the history before
     /// the loop may dose again.
-    @MainActor private func finishPumpReturn() async {
+    /// `afterLook`: the return ends a look of the watch's only (see `apply`), which lets a refused bolus be tried again.
+    @MainActor private func finishPumpReturn(afterLook: Bool = false) async {
+        auditFoundNoGap = false
         guard let odometer = apsManager.pumpManager as? PumpDeliveryOdometer else {
             UntetheredGate.update { $0.pumpReturnPending = false }
             publish()
@@ -1334,6 +1352,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         }
         UntetheredGate.update { $0.pumpReturnPending = false }
         publish()
+        PhonePumpReturn.note(cleanLook: afterLook && auditFoundNoGap)
         debug(.watch, "Untethered: pump is back on the phone")
         // the session's start dropped the watch's copy: a phone gone again right after leaves it none to start from
         scheduleStandingGrant(settingsChanged: true, immediately: true)
@@ -1445,7 +1464,10 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             let verdict = UntetheredAudit.verdict(delivered: point.delivered, expected: expected)
             // insulin no record explains counts at once, whatever the history still lacks: dosing must not go over it
             if case let .unrecorded(units) = verdict {
+                auditFoundNoGap = false
                 try await bookGap(units, at: point.end, epoch: point.epoch)
+            } else {
+                auditFoundNoGap = true
             }
             // only the complete history speaks: what the watch's last records would explain is no finding
             guard historyComplete else { return }
