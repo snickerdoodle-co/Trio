@@ -40,6 +40,11 @@ struct UntetheredSession: Codable, Equatable {
         case watchHoldsPump(epoch: Int, status: UntetheredPodStatus?)
         /// The pod reported a foreign controller before the watch's message arrived.
         case foreignSessionDetected(UntetheredPodStatus?)
+        /// Records of a newer session the phone never granted reached it: whether the watch holds the pump is asked,
+        /// not assumed (Ponytail's review, 15 November).
+        case watchRecordsSeen(epoch: Int)
+        /// The watch says a newer session the phone never granted is over (released, or a failed takeover).
+        case watchSessionEnded(epoch: Int)
     }
 
     enum WatchEvent: Equatable {
@@ -106,6 +111,8 @@ struct UntetheredSession: Codable, Equatable {
 
     /// Phone: set when a refused pod command, not a start, made it ask the watch. Optional so older saved states load.
     private(set) var checkingForeignSession: Bool?
+    /// Phone: this session ended with the watch's hand-back. Optional so older saved states load.
+    private(set) var handedBack: Bool?
     /// The phone is only asking whether the watch has the pump after another controller used the pod. It shows as
     /// that, not as untethered: on 3 November the second tester's phone said "Untethered on Apple Watch" for 5 minutes
     /// while the watch had nothing, and again after a refused bolus.
@@ -141,14 +148,45 @@ struct UntetheredSession: Codable, Equatable {
             return [.releasePump]
 
         case let (.starting, .watchHoldsPump(watchEpoch, status)) where watchEpoch > epoch:
+            // "not holding" for a session the phone never knew: that session is over. The phone takes its number,
+            // so the watch's later messages for it (its release, its last records) are that ended session's, not a
+            // new one's, and its records come over (Ponytail's review, 15 November: the phone otherwise ignored
+            // the release and later went back to "watch in charge" on the records, with nobody looping).
             guard status != nil else {
                 phase = .idle
-                return [.takePump]
+                epoch = watchEpoch
+                forced = true
+                return [.takePump, .reconcile]
             }
             self = UntetheredSession(phase: .active, epoch: watchEpoch)
             startStatus = status
             startedWithoutPhone = true
             return [.releasePump]
+
+        // records of a session the phone never knew: asked, as after a refused pod command. Taken as "the watch holds
+        // the pump" they released the pod for a session that was over (Ponytail's review, 15 November).
+        case let (.idle, .watchRecordsSeen(watchEpoch)) where watchEpoch > epoch:
+            phase = .starting
+            leaseExpiresAt = now
+            statusQueried = true
+            checkingForeignSession = true
+            startStatus = nil
+            return [.send(.statusQuery)]
+
+        // a session the phone never knew ended on the watch: the phone takes its number, keeps (or takes back) the
+        // pump, and gets the session's records
+        case let (.idle, .watchSessionEnded(watchEpoch)) where watchEpoch > epoch:
+            epoch = watchEpoch
+            forced = true
+            // the last session's pod reading is no start for this one
+            startStatus = nil
+            return [.reconcile]
+
+        case let (.starting, .watchSessionEnded(watchEpoch)) where watchEpoch > epoch:
+            phase = .idle
+            epoch = watchEpoch
+            forced = true
+            return [.takePump, .reconcile]
 
         case let (.idle, .foreignSessionDetected(status)):
             phase = .starting
@@ -203,6 +241,7 @@ struct UntetheredSession: Codable, Equatable {
              let (.ending, .received(.handback(status), _)):
             phase = .idle
             forced = false
+            handedBack = true
             returnedTempBasal = status?.tempBasal
             returnedHighTemp = status?.runningHighTemp
             return [.takePump, .send(.handbackAck), .reconcile]
@@ -210,6 +249,13 @@ struct UntetheredSession: Codable, Equatable {
         case (.idle, .received(.handback, _)):
             // our acknowledgement got lost; the pump is ours already
             return [.send(.handbackAck)]
+
+        // a takeover reported after the phone gave up on it and took the pump back: the watch stops, and its records
+        // come over (Ponytail's review, 15 November). Only for this session, and not after its hand-back: the watch
+        // sends the report again after a send error, and a copy arriving then is no takeover (Claude Fable's review).
+        // A newer session is the watch starting without the phone.
+        case (.idle, .received(.takeoverComplete, _)) where handedBack != true:
+            return [.send(.revoke), .reconcile]
 
         case (.active, .received(.released, _)),
              (.ending, .received(.released, _)),
@@ -399,5 +445,6 @@ extension UntetheredSession {
         handbackStatus = try container.decodeIfPresent(UntetheredPodStatus?.self, forKey: .handbackStatus)
         handbackOfferedAt = try container.decodeIfPresent(Date.self, forKey: .handbackOfferedAt)
         handbackLetGo = try container.decodeIfPresent(Bool.self, forKey: .handbackLetGo) ?? handbackLetGo
+        handedBack = try container.decodeIfPresent(Bool.self, forKey: .handedBack)
     }
 }

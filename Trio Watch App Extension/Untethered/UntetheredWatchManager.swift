@@ -164,6 +164,13 @@ import WatchKit
     var isActive: Bool { data.session.phase == .active || data.session.phase == .ending }
 
     private init() {
+        // every stored property is set before a method of self runs: Swift refuses `adoptSavedState()` first
+        data = store.data
+        adoptSavedState()
+    }
+
+    /// Takes on the saved state: at launch, and when a state locked at launch opens later.
+    private func adoptSavedState() {
         data = store.data
         // before the watch's own G7 reader starts at launch: a running session keeps the sensor
         updateReaderStandAside()
@@ -185,6 +192,11 @@ import WatchKit
 
     /// Every change reaches the screens at once, with the phone or without it.
     func refresh() {
+        if store.openIfLocked() {
+            Task { await WatchLogger.shared.log("⌚️ Untethered: saved state open again, taken on", force: true) }
+            adoptSavedState()
+            return
+        }
         data = store.data
         updateHandbackWarning()
         // a new session counts from its own start
@@ -587,6 +599,20 @@ import WatchKit
         reply: (([String: Any]) -> Void)? = nil,
         also change: ((inout UntetheredWatchData) -> Void)? = nil
     ) {
+        // a saved state still locked (before the first unlock after a restart) may hold a running session: nothing
+        // starts or changes over it, and the phone, without an answer, keeps or takes back the pump
+        // The step that found it open is left too: the devices of the state taken on are restored a main-queue hop
+        // later, and the step would run without them (Claude Fable's review, 15 November). The phone sends again.
+        if store.isLocked {
+            if store.openIfLocked() {
+                adoptSavedState()
+                Task { await WatchLogger.shared.log("⌚️ Untethered: saved state open again, taken on; this session step left", force: true) }
+            } else {
+                Task { await WatchLogger.shared.log("⌚️ Untethered: a session step left for later, the saved state is locked", force: true) }
+            }
+            reply?([:])
+            return
+        }
         let wasActive = isActive
         let wasIdle = store.data.session.phase == .idle
         let wasFallbackStart = isFallbackSession && store.data.session.phase == .starting
@@ -1502,10 +1528,10 @@ import WatchKit
             title: String(localized: "Handing Back to iPhone"),
             body: reason == .podStall
                 ? String(
-                    localized: "The watch hasn't reached the pod for \(minutes) minutes. The iPhone takes the pump back as soon as it gets the request; keep it nearby."
+                    localized: "The watch hasn't reached the pod for \(minutes) minutes. The iPhone takes the pump back as soon as it gets the request; keep it nearby. Bolus on the iPhone; the watch takes boluses again in 5 minutes if the iPhone hasn't taken the pump."
                 )
                 : String(
-                    localized: "The watch has had no sensor reading and no loop for \(minutes) minutes. The iPhone takes the pump back as soon as it gets the request; keep it nearby."
+                    localized: "The watch has had no sensor reading and no loop for \(minutes) minutes. The iPhone takes the pump back as soon as it gets the request; keep it nearby. Bolus on the iPhone; the watch takes boluses again in 5 minutes if the iPhone hasn't taken the pump."
                 )
         )
         send(.handbackRequested(minutesWithoutLoop: minutes), epoch: data.session.epoch, queueing: true)
@@ -1752,13 +1778,19 @@ import WatchKit
             resend(missing.map(\.id))
             streamRecords()
         }
-        finishSyncIfDone(epoch: epoch)
+        finishSyncIfDone(epoch: epoch, askedByPhone: true)
     }
 
-    private func finishSyncIfDone(epoch: Int) {
+    private func finishSyncIfDone(epoch: Int, askedByPhone: Bool = false) {
         let session = store.data.session
         let over = epoch != session.epoch || session.phase == .idle
-        guard over, store.data.entries[epoch] != nil, (store.data.pending[epoch] ?? [:]).isEmpty else { return }
+        guard over, (store.data.pending[epoch] ?? [:]).isEmpty else { return }
+        // a session with no records here (a takeover that failed, or one synced already) is done as well: the phone
+        // otherwise waited for it for good, and its pod gap check stayed off (Claude Fable's review, 15 November)
+        guard store.data.entries[epoch] != nil else {
+            if askedByPhone { send(.syncDone, epoch: epoch) }
+            return
+        }
         send(.syncDone, epoch: epoch)
         store.update {
             $0.pending[epoch] = nil

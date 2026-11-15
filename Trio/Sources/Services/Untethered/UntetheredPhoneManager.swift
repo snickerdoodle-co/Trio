@@ -14,22 +14,95 @@ enum UntetheredGate {
     private static let lock = NSLock()
     private static let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("untethered-phone.json")
-    private static var cached: UntetheredPhoneState = (try? Data(contentsOf: url))
-        .flatMap { try? JSONDecoder().decode(UntetheredPhoneState.self, from: $0) } ?? UntetheredPhoneState()
+    private static var cached = UntetheredPhoneState()
+    /// The saved state is there but can't be read yet: iOS can wake Trio after a restart before the first unlock,
+    /// when the file is still protected. Until it is read, the phone doesn't dose and saves nothing over it: an idle
+    /// state written then would wipe out the watch's running session (Ponytail's review, 15 November).
+    private static var locked = false
+    private static var loaded = false
 
-    static var state: UntetheredPhoneState { lock.withLock { cached } }
+    /// Reads the saved state once, and again while it is locked. Called with the lock held.
+    private static func loadIfNeeded() {
+        guard !loaded || locked else { return }
+        loaded = true
+        let saved: Data
+        do {
+            saved = try Data(contentsOf: url)
+        } catch {
+            if (error as? CocoaError)?.code == .fileReadNoSuchFile || !FileManager.default.fileExists(atPath: url.path) {
+                locked = false
+                return
+            }
+            if !locked {
+                locked = true
+                warning(.watch, "Untethered: saved state locked (\(error.localizedDescription)); no dosing until it opens")
+                DispatchQueue.main.async { observeProtectedData() }
+            }
+            return
+        }
+        if locked {
+            debug(.watch, "Untethered: saved state open again, taken on")
+            // what launch would have resumed from it runs now (`UntetheredPhoneManager.stateOpened`)
+            DispatchQueue.main.async {
+                Foundation.NotificationCenter.default.post(name: .untetheredGateOpened, object: nil)
+                Foundation.NotificationCenter.default.post(name: .untetheredGateDidChange, object: nil)
+            }
+        }
+        locked = false
+        do {
+            cached = try JSONDecoder().decode(UntetheredPhoneState.self, from: saved)
+        } catch {
+            // kept aside rather than overwritten by the next save, so nothing is lost silently
+            let aside = url.appendingPathExtension("unreadable")
+            try? FileManager.default.removeItem(at: aside)
+            try? FileManager.default.moveItem(at: url, to: aside)
+            cached = UntetheredPhoneState()
+            warning(.watch, "Untethered: saved state unreadable, kept aside: \(error)")
+        }
+    }
+
+    private static var protectedDataObserver: NSObjectProtocol?
+
+    /// Reads again as soon as the phone is unlocked, and tells the screens and the manager.
+    private static func observeProtectedData() {
+        guard protectedDataObserver == nil else { return }
+        protectedDataObserver = Foundation.NotificationCenter.default.addObserver(
+            forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            // opening posts what follows itself
+            lock.withLock { loadIfNeeded() }
+        }
+    }
+
+    static var state: UntetheredPhoneState { lock.withLock {
+        loadIfNeeded()
+        return cached
+    } }
+
+    /// The saved state couldn't be read yet.
+    static var isLocked: Bool { lock.withLock {
+        loadIfNeeded()
+        return locked
+    } }
 
     /// The phone may loop, bolus and change the pump.
     static var phoneMayDose: Bool {
-        let state = self.state
-        return state.session.isIdle && !state.pumpReturnPending
+        let (state, locked) = lock.withLock { () -> (UntetheredPhoneState, Bool) in
+            loadIfNeeded()
+            return (cached, self.locked)
+        }
+        return !locked && state.session.isIdle && !state.pumpReturnPending
     }
 
-    /// Every change reaches the screens, whichever path made it.
+    /// Every change reaches the screens, whichever path made it. While the saved state is locked a change stays in
+    /// memory only; the saved state, once read, is what counts.
     @discardableResult static func update<T>(_ change: (inout UntetheredPhoneState) -> T) -> T {
         let result = lock.withLock {
+            loadIfNeeded()
             let result = change(&cached)
-            if let data = try? JSONEncoder().encode(cached) {
+            if !locked, let data = try? JSONEncoder().encode(cached) {
                 try? data.write(to: url, options: .atomic)
             }
             return result
@@ -44,6 +117,7 @@ enum UntetheredGate {
 extension Notification.Name {
     static let untetheredSessionDidChange = Notification.Name("untetheredSessionDidChange")
     static let untetheredGateDidChange = Notification.Name("untetheredGateDidChange")
+    static let untetheredGateOpened = Notification.Name("untetheredGateOpened")
 }
 
 enum UntetheredError: LocalizedError {
@@ -107,6 +181,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         openAPS = OpenAPS(storage: storage, tddStorage: tddStorage, glucoseStorage: glucoseStorage, carbsStorage: carbsStorage)
         Foundation.NotificationCenter.default.publisher(for: .untetheredGateDidChange)
             .sink { [weak self] _ in Task { @MainActor in self?.publish() } }
+            .store(in: &subscriptions)
+        Foundation.NotificationCenter.default.publisher(for: .untetheredGateOpened)
+            .sink { [weak self] _ in Task { @MainActor in await self?.stateOpened() } }
             .store(in: &subscriptions)
         Foundation.NotificationCenter.default.publisher(for: .didUpdateOverrideConfiguration)
             .receive(on: DispatchQueue.main)
@@ -183,10 +260,39 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             // the home screen's banner warns while the iPhone's Bluetooth is off (the state manager is main-actor)
             self.apsManager.bluetoothManager?.addBluetoothObserver(self, queue: .main)
             await self.forwardCancellations()
+            if UntetheredGate.isLocked {
+                self.setError(String(localized: "Trio can't read its watch mode state until the iPhone is unlocked. The iPhone doesn't dose until then."))
+            }
             if self.state.pumpReturnPending { await self.finishPumpReturn() }
             await self.uploadSpans()
             self.updateTimers()
         }
+    }
+
+    /// The saved state, locked at launch, opened: what launch resumes from it runs now (Claude Fable's review,
+    /// 15 November).
+    /// Messages from the watch that came while the saved state was locked, in the order they came.
+    private var lockedMessages: [[String: Any]] = []
+    private let lockedMessagesLock = NSLock()
+    private static let lockedMessagesLimit = 200
+
+    @MainActor private func stateOpened() async {
+        // the message about the locked state lived in memory only; the state read now has its own
+        wasIdle = state.session.isIdle
+        // the kept messages first: a pump return waits on the pod, and an answer among them may decide it
+        let kept = lockedMessagesLock.withLock { () -> [[String: Any]] in
+            defer { lockedMessages.removeAll() }
+            return lockedMessages
+        }
+        if !kept.isEmpty { debug(.watch, "Untethered: taking on \(kept.count) message(s) kept while the saved state was locked") }
+        // one after the other and in full, so the pump return below is decided on what they say
+        for payload in kept {
+            guard let envelope = try? UntetheredEnvelope.decode(payload) else { continue }
+            await handle(envelope, replyHandler: nil)
+        }
+        updateTimers()
+        publish()
+        if state.pumpReturnPending { await finishPumpReturn() }
     }
 
     var isWatchInCharge: Bool { !state.session.isIdle }
@@ -433,6 +539,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     /// - Returns: why the start was refused, nil when it went on to the watch
     @discardableResult @MainActor func start(linkedOverrideID: String? = nil) async -> String? {
+        guard !UntetheredGate.isLocked else {
+            return String(localized: "Trio can't read its watch mode state until the iPhone is unlocked. The iPhone doesn't dose until then.")
+        }
         guard state.session.isIdle, !state.pumpReturnPending else {
             return String(localized: "The phone is still taking the pump back from the last session.")
         }
@@ -485,6 +594,11 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     /// Reaches for the pod before the watch is told to stop: a phone that can't reach it leaves the watch dosing,
     /// instead of taking a pump that then neither side doses.
     @MainActor func forceTakeBack() async {
+        // the state locked: whether the watch has the pump is unknown here, and the take-back would save over it
+        guard !UntetheredGate.isLocked else {
+            setError(String(localized: "Trio can't read its watch mode state until the iPhone is unlocked. The iPhone doesn't dose until then."))
+            return
+        }
         guard let control = apsManager.pumpManager as? ExclusiveDeviceControl else {
             await apply(.forceTakeBack)
             return
@@ -541,111 +655,142 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     /// `payload` holds an `UntetheredEnvelope`. Every path calls `replyHandler` when there is one.
     func receive(_ payload: [String: Any], replyHandler: (([String: Any]) -> Void)?) {
+        // the saved state locked: its epoch and phase are unknown, and a message taken on now (the watch holding the
+        // pump, say) would release the pod beside a state that, once read, says otherwise. Kept and taken on once the
+        // state opens: some the watch sends only once, as its release (Ponytail's review, 15 November).
+        if UntetheredGate.isLocked {
+            // over the limit, record batches give way first: the watch sends them again, its release it doesn't
+            let isRecords: Bool = {
+                guard let envelope = try? UntetheredEnvelope.decode(payload), case .records = envelope.message else { return false }
+                return true
+            }()
+            let kept = lockedMessagesLock.withLock { () -> Bool in
+                if lockedMessages.count >= Self.lockedMessagesLimit {
+                    guard !isRecords, let index = lockedMessages.firstIndex(where: { held in
+                        guard let envelope = try? UntetheredEnvelope.decode(held), case .records = envelope.message else { return false }
+                        return true
+                    }) else { return false }
+                    lockedMessages.remove(at: index)
+                }
+                lockedMessages.append(payload)
+                return true
+            }
+            debug(.watch, "Untethered: message from the watch \(kept ? "kept for later" : "left (too many kept)"), the saved state is locked")
+            replyHandler?([:])
+            return
+        }
         guard let envelope = try? UntetheredEnvelope.decode(payload) else {
             warning(.watch, "Untethered: unreadable message from the watch")
             replyHandler?([:])
             return
         }
-        Task { @MainActor in
-            // a session the watch started without the phone: taken on before its records are stored, which would
-            // otherwise be confirmed and dropped as a finished session's. Queued messages arrive in order, so its
-            // end comes after.
-            if self.state.session.isIdle || self.state.session.phase == .starting,
-               envelope.epoch > self.state.session.epoch
-            {
-                let unknownWatchSince = self.state.session.unknownWatchSince
-                defer {
-                    if let unknownWatchSince, self.state.session.epoch == envelope.epoch {
-                        Task { await self.adoptProvisionalAudit(of: unknownWatchSince, epoch: envelope.epoch) }
-                    }
-                }
-                switch envelope.message {
-                case let .statusReport(holding: .some(status)),
-                     let .takeoverComplete(status):
-                    await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: status))
-                case .statusReport(holding: nil) where self.state.session.phase == .starting:
-                    await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: nil))
-                // only while idle: during the ownership check (`.starting`) records say nothing about who holds
-                // the pod, and taken as "not holding" they'd end the check and drop the records (below)
-                case .records where self.state.session.isIdle:
-                    await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: nil))
-                default: break
+        Task { @MainActor in await self.handle(envelope, replyHandler: replyHandler) }
+    }
+
+    /// One message from the watch, taken on in full; awaited where the order matters (the messages kept while the
+    /// saved state was locked, Claude Fable's review, 15 November).
+    @MainActor private func handle(_ envelope: UntetheredEnvelope, replyHandler: (([String: Any]) -> Void)?) async {
+        // a session the watch started without the phone: taken on before its records are stored, which would
+        // otherwise be confirmed and dropped as a finished session's. Queued messages arrive in order, so its
+        // end comes after.
+        if self.state.session.isIdle || self.state.session.phase == .starting,
+           envelope.epoch > self.state.session.epoch
+        {
+            let unknownWatchSince = self.state.session.unknownWatchSince
+            defer {
+                if let unknownWatchSince, self.state.session.epoch == envelope.epoch {
+                    Task { await self.adoptProvisionalAudit(of: unknownWatchSince, epoch: envelope.epoch) }
                 }
             }
             switch envelope.message {
-            case let .records(records):
-                let stored = await self.ingestInOrder(records, epoch: envelope.epoch)
-                // acknowledged as soon as stored, so the watch's backlog stays small while it loops
-                if let replyHandler,
-                   let payload = try? UntetheredEnvelope(epoch: envelope.epoch, message: .recordsStored(stored)).payload()
-                {
-                    replyHandler(payload)
-                } else {
-                    replyHandler?([:])
-                    self.send(.recordsStored(stored), epoch: envelope.epoch)
-                }
-            case .syncDone:
-                replyHandler?([:])
-                await self.finishSync(epoch: envelope.epoch)
-            case .standingGrantRequest:
-                replyHandler?([:])
-                // a copy for another build would start a session the two can't share
-                guard UntetheredVersion.mismatch(watch: envelope.appVersion) == nil else { return }
-                // whatever the fingerprint says: the watch has none
-                self.scheduleStandingGrant(settingsChanged: true, immediately: true)
-            case .startRequest:
-                replyHandler?([:])
-                // the watch asks again when its request seemed lost: one already on its way here is not refused
-                if self.isCheckingDevices || self.state.session.phase == .preparing || self.state.session.phase == .starting {
-                    debug(.watch, "Untethered: the watch asked again for the start already under way")
-                    return
-                }
-                // a watch app watchOS hasn't updated yet (or an older phone): no hand-over between two builds
-                if let reason = UntetheredVersion.mismatch(watch: envelope.appVersion) {
-                    warning(.watch, "Untethered: start refused, \(reason)")
-                    self.send(.startRefused(reason: reason), epoch: envelope.epoch)
-                    return
-                }
-                if let reason = await self.start() {
-                    self.send(.startRefused(reason: reason), epoch: envelope.epoch)
-                }
-            case let .handbackRequested(minutes):
-                replyHandler?([:])
-                guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { return }
-                // the fallback's hand-back, once the phone is back, comes the same way with no minutes: it's no stall
-                if minutes > 0 {
-                    warning(.watch, "Untethered: the watch hasn't reached the pod for \(minutes) min and asks the phone to take it back")
-                } else {
-                    info(.watch, "Untethered: the watch hands the pump back, the phone is in reach again")
-                }
-                // as Take Back the Pump Now: the phone reaches for the pod first, and leaves the watch dosing if it can't.
-                // The pod may still be busy with the watch's last command: a few more tries, a little apart, rather
-                // than waiting for the watch's next request (24 October: refused at 13:55:56, taken back by hand 14:07).
-                for attempt in 1 ... Self.handbackRequestTries {
-                    await self.forceTakeBack()
-                    // trying again in 20 s won't turn Bluetooth on: the watch asks again later
-                    guard !self.isBluetoothOff else { break }
-                    guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch,
-                          attempt < Self.handbackRequestTries
-                    else { break }
-                    debug(.watch, "Untethered: the pod was busy, trying again in \(Int(Self.handbackRequestRetryDelay)) s (\(attempt) of \(Self.handbackRequestTries))")
-                    self.setError(String(localized: "The pod is still busy with the watch. The phone tries again in a moment; keep it near the pod."))
-                    try? await Task.sleep(nanoseconds: UInt64(Self.handbackRequestRetryDelay * 1_000_000_000))
-                    guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { break }
-                }
-            case let .remoteTreatmentResult(id, delivered, message):
-                replyHandler?([:])
-                self.answerRemoteTreatment(id, delivered ? .delivered(message) : .refused(message))
-            case let .dosingModeChanged(mode):
-                replyHandler?([:])
-                guard envelope.epoch >= self.state.session.epoch else { return }
-                var settings = self.settingsManager.settings
-                guard settings.dosingMode != mode else { return }
-                settings.dosingMode = mode
-                self.settingsManager.settings = settings
-            default:
-                await self.apply(.received(envelope.message, epoch: envelope.epoch), reply: replyHandler)
+            case let .statusReport(holding: .some(status)),
+                 let .takeoverComplete(status):
+                await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: status))
+            case .statusReport(holding: nil) where self.state.session.phase == .starting:
+                await self.apply(.watchHoldsPump(epoch: envelope.epoch, status: nil))
+            // records alone don't hand the pump over: the watch is asked (Ponytail's review, 15 November). Only
+            // while idle: during the ownership check (`.starting`) the answer to it decides.
+            case .records where self.state.session.isIdle:
+                await self.apply(.watchRecordsSeen(epoch: envelope.epoch))
+            // a session the phone never knew is over: its later messages then belong to an ended session
+            case .released, .takeoverFailed:
+                await self.apply(.watchSessionEnded(epoch: envelope.epoch))
+            default: break
             }
+        }
+        switch envelope.message {
+        case let .records(records):
+            let stored = await self.ingestInOrder(records, epoch: envelope.epoch)
+            // acknowledged as soon as stored, so the watch's backlog stays small while it loops
+            if let replyHandler,
+               let payload = try? UntetheredEnvelope(epoch: envelope.epoch, message: .recordsStored(stored)).payload()
+            {
+                replyHandler(payload)
+            } else {
+                replyHandler?([:])
+                self.send(.recordsStored(stored), epoch: envelope.epoch)
+            }
+        case .syncDone:
+            replyHandler?([:])
+            await self.finishSync(epoch: envelope.epoch)
+        case .standingGrantRequest:
+            replyHandler?([:])
+            // a copy for another build would start a session the two can't share
+            guard UntetheredVersion.mismatch(watch: envelope.appVersion) == nil else { return }
+            // whatever the fingerprint says: the watch has none
+            self.scheduleStandingGrant(settingsChanged: true, immediately: true)
+        case .startRequest:
+            replyHandler?([:])
+            // the watch asks again when its request seemed lost: one already on its way here is not refused
+            if self.isCheckingDevices || self.state.session.phase == .preparing || self.state.session.phase == .starting {
+                debug(.watch, "Untethered: the watch asked again for the start already under way")
+                return
+            }
+            // a watch app watchOS hasn't updated yet (or an older phone): no hand-over between two builds
+            if let reason = UntetheredVersion.mismatch(watch: envelope.appVersion) {
+                warning(.watch, "Untethered: start refused, \(reason)")
+                self.send(.startRefused(reason: reason), epoch: envelope.epoch)
+                return
+            }
+            if let reason = await self.start() {
+                self.send(.startRefused(reason: reason), epoch: envelope.epoch)
+            }
+        case let .handbackRequested(minutes):
+            replyHandler?([:])
+            guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { return }
+            // the fallback's hand-back, once the phone is back, comes the same way with no minutes: it's no stall
+            if minutes > 0 {
+                warning(.watch, "Untethered: the watch hasn't reached the pod for \(minutes) min and asks the phone to take it back")
+            } else {
+                info(.watch, "Untethered: the watch hands the pump back, the phone is in reach again")
+            }
+            // as Take Back the Pump Now: the phone reaches for the pod first, and leaves the watch dosing if it can't.
+            // The pod may still be busy with the watch's last command: a few more tries, a little apart, rather
+            // than waiting for the watch's next request (24 October: refused at 13:55:56, taken back by hand 14:07).
+            for attempt in 1 ... Self.handbackRequestTries {
+                await self.forceTakeBack()
+                // trying again in 20 s won't turn Bluetooth on: the watch asks again later
+                guard !self.isBluetoothOff else { break }
+                guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch,
+                      attempt < Self.handbackRequestTries
+                else { break }
+                debug(.watch, "Untethered: the pod was busy, trying again in \(Int(Self.handbackRequestRetryDelay)) s (\(attempt) of \(Self.handbackRequestTries))")
+                self.setError(String(localized: "The pod is still busy with the watch. The phone tries again in a moment; keep it near the pod."))
+                try? await Task.sleep(nanoseconds: UInt64(Self.handbackRequestRetryDelay * 1_000_000_000))
+                guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { break }
+            }
+        case let .remoteTreatmentResult(id, delivered, message):
+            replyHandler?([:])
+            self.answerRemoteTreatment(id, delivered ? .delivered(message) : .refused(message))
+        case let .dosingModeChanged(mode):
+            replyHandler?([:])
+            guard envelope.epoch >= self.state.session.epoch else { return }
+            var settings = self.settingsManager.settings
+            guard settings.dosingMode != mode else { return }
+            settings.dosingMode = mode
+            self.settingsManager.settings = settings
+        default:
+            await self.apply(.received(envelope.message, epoch: envelope.epoch), reply: replyHandler)
         }
     }
 
@@ -1243,10 +1388,20 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         }
     }
 
+    /// A pump return is being finished (`finishPumpReturn`).
+    private var pumpReturnRunning = false
     /// Reads the pump until it answers, then audits its delivered total against the history before
     /// the loop may dose again.
     /// `afterLook`: the return ends a look of the watch's only (see `apply`), which lets a refused bolus be tried again.
     @MainActor private func finishPumpReturn(afterLook: Bool = false) async {
+        // one at a time: a message taken on as the saved state opened can start one beside the launch's own
+        // (Claude Fable's review, 15 November)
+        guard !pumpReturnRunning else {
+            debug(.watch, "Untethered: pump return already under way")
+            return
+        }
+        pumpReturnRunning = true
+        defer { pumpReturnRunning = false }
         auditFoundNoGap = false
         guard let odometer = apsManager.pumpManager as? PumpDeliveryOdometer else {
             UntetheredGate.update { $0.pumpReturnPending = false }
@@ -1266,7 +1421,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         defer { if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) } }
         let escalation = Task { @MainActor in
             try? await Task.sleep(nanoseconds: Self.pumpEscalateAfter)
-            guard !Task.isCancelled, let control, !control.isControlReady else { return }
+            // not once the watch holds the pump again: escalating lifts the release (Ponytail's review, 15 November)
+            guard !Task.isCancelled, let control, !control.isControlReady, self.state.pumpReturnPending,
+                  !control.isControlReleased else { return }
             let outcome = control.escalateTakeControl() ?? "nothing to escalate"
             debug(.watch, "Untethered: no pump link after 12 s, escalating: \(outcome)")
         }
