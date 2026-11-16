@@ -6,6 +6,7 @@ import LoopKit
 import OmnipodKit
 import Swinject
 import UIKit
+import UserNotifications
 import WatchConnectivity
 
 /// Read by the loop, bolus and watch paths without resolving any service, so a relaunch holds
@@ -630,6 +631,19 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         await apply(.forceTakeBack)
     }
 
+    /// The phone took the pump back because the watch couldn't reach the pod.
+    private func notifyPumpBackFromStalledWatch(minutes: Int) {
+        let content = UNMutableNotificationContent()
+        content.title = String(localized: "Pump Back on iPhone")
+        content.body = String(
+            localized: "The watch couldn't reach the pod for \(minutes) minutes, so the iPhone took the pump back. Start untethered mode again when you want."
+        )
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "untethered.pumpBackFromWatch", content: content, trigger: nil)
+        )
+    }
+
     /// The iPhone's Bluetooth is off, as in flight mode: no pod is in reach.
     @MainActor var isBluetoothOff: Bool {
         apsManager.bluetoothManager?.bluetoothState == .poweredOff
@@ -779,6 +793,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                 try? await Task.sleep(nanoseconds: UInt64(Self.handbackRequestRetryDelay * 1_000_000_000))
                 guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { break }
             }
+            // the watch's own notice may have gone unseen: the phone says it has the pump (15 November, 19:56 and 20:26)
+            if minutes > 0, self.state.session.isIdle { self.notifyPumpBackFromStalledWatch(minutes: minutes) }
         case let .remoteTreatmentResult(id, delivered, message):
             replyHandler?([:])
             self.answerRemoteTreatment(id, delivered ? .delivered(message) : .refused(message))
@@ -1814,12 +1830,14 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     @MainActor private func ingest(_ records: [UntetheredRecord], epoch: Int) async -> [UUID] {
         // a session whose history is complete takes nothing more: a late copy (a queued transfer, a resend after a
         // relaunch) would store its carbs and doses a second time. Confirmed, so the watch lets go of it.
-        let session = state.session
-        guard state.applied[epoch] != nil || (epoch == session.epoch && !session.isIdle) else {
-            // a newer session's records aren't confirmed: the watch sends them again once the phone follows it
-            guard epoch <= session.epoch else { return [] }
+        switch state.storesRecords(epoch: epoch) {
+        case true?: break
+        case false?:
             debug(.watch, "Untethered: \(records.count) record(s) of finished session \(epoch) ignored")
             return records.map(\.id)
+        case nil:
+            // a newer session's records aren't confirmed: the watch sends them again once the phone follows it
+            return []
         }
         var applied = state.applied[epoch] ?? [:]
         // the Apple Watch update waits until the batch is in: one per stored reading slowed the history to a crawl
@@ -2168,7 +2186,10 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     @MainActor private func finishSync(epoch: Int) async {
         await freezeWatchDoses(epoch: epoch)
-        UntetheredGate.update { $0.applied[epoch] = nil }
+        UntetheredGate.update {
+            $0.applied[epoch] = nil
+            $0.syncedEpoch = max($0.syncedEpoch ?? epoch, epoch)
+        }
         publish()
         debug(.watch, "Untethered: history of session \(epoch) complete")
         // a return audited before the history was complete is judged again; one still reading the pump does it itself

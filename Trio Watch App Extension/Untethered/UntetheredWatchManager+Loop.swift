@@ -66,6 +66,8 @@ extension UntetheredWatchManager {
                     self.isDeterminationPending = false
                     self.runLoop(.treatment)
                 }
+                if trigger == .podBack, self.podFrontTry == .running { self.podFrontTry = nil }
+                if self.podFrontTry == .pending { self.retryPodInFront() }
                 self.endLoopHold(releaseHold)
             }
             // the pod only once the sensor's link is closed (see `waitForSensorQuiet`)
@@ -77,10 +79,13 @@ extension UntetheredWatchManager {
             }
             // the pod read is a pod command too: none without background time left (see `enact`)
             var explained = true
+            var podReached = true
             if enacts, !self.loopHoldExpired {
-                _ = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
+                let synced = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
                     pump.ensureCurrentPumpData { continuation.resume(returning: $0) }
                 }
+                // pod data older than the kit's own 6 minutes: the pod didn't answer this loop
+                podReached = synced.map { Date().timeIntervalSince($0) <= 6 * 60 } ?? false
                 // before the determination, so its IOB counts what the records miss
                 explained = self.podTotalExplained(pump, grant: grant)
             }
@@ -140,6 +145,9 @@ extension UntetheredWatchManager {
                 }
                 if enacts {
                     do {
+                        // a loop that didn't reach the pod isn't one, also when it had nothing to send: such loops
+                        // counted as done and kept the stall from being noticed (15 November, 22:41 to 23:06)
+                        guard podReached else { throw UntetheredWatchError.podNotConnected }
                         // A selection made while this determination was running invalidates its old permissions.
                         guard self.data.grant?.dosingMode == grant.dosingMode else {
                             record(enactedAt: nil)
@@ -193,6 +201,11 @@ extension UntetheredWatchManager {
                     self.podRetryPending = (newestGlucose ?? .distantPast, Date())
                     self.podLinkFailures.append(Date())
                     if self.podLinkFailures.count > 12 { self.podLinkFailures.removeFirst(self.podLinkFailures.count - 12) }
+                    // the try with Trio in front failed too: opening Trio doesn't bring the pod back
+                    if trigger == .podBack, self.podFrontTry == .running {
+                        self.requestHandback(minutes: max(1, Int(Date().timeIntervalSince(self.loopReference ?? Date()) / 60)), reason: .podStall)
+                    }
+                    self.checkPodLinkEarly()
                 }
             }
             if !self.loopHoldExpired, self.isActive {
@@ -396,6 +409,7 @@ enum UntetheredWatchError: LocalizedError {
     case notEnoughGlucose
     case staleGlucose
     case noBackgroundTime
+    case podNotConnected
 
     var errorDescription: String? {
         switch self {
@@ -404,6 +418,7 @@ enum UntetheredWatchError: LocalizedError {
         case .noDetermination: return String(localized: "The algorithm gave no result.")
         case .noPump: return String(localized: "The watch doesn't have the pump.")
         case .noBackgroundTime: return String(localized: "watchOS gave the watch no background time for the pump.")
+        case .podNotConnected: return String(localized: "The watch couldn't reach the pod.")
         }
     }
 }
@@ -1690,6 +1705,10 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         guard isActive else { return }
         let state = WKApplication.shared().applicationState
         Task { await WatchLogger.shared.log("⌚️ Untethered: Trio in front (state \(state.rawValue))", force: true) }
+        // opened after the early notice (from it, Trio may count as in front only a moment later)
+        if podLinkEarlyNoticeAt != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.retryPodInFront() }
+        }
         // Opened from a notification, Trio may not count as in front yet when this runs, and the workout start is
         // skipped (31 October, 11:09: "Watch Took Over" tapped, no workout). Asked again once it has settled.
         for delay in [1.0, 3.0] {
@@ -1814,6 +1833,11 @@ extension UntetheredWatchManager: CGMManagerDelegate {
     /// otherwise only opening the app clears. The link is torn down and searched for afresh.
     func checkPodLink(now: Date = Date()) {
         checkSensorStall(now: now)
+        checkPodLinkEarly(now: now)
+        // the early notice gets a few minutes to be answered before the pump goes back, up to the longer stall limit
+        if let noticeAt = podLinkEarlyNoticeAt, now.timeIntervalSince(noticeAt) < Self.podLinkEarlyGrace,
+           let lastLoop = loopReference, now.timeIntervalSince(lastLoop) < Self.podLinkStallLimit
+        { return }
         guard data.session.phase == .active, let pump = pumpManager,
               let lastLoop = loopReference,
               now.timeIntervalSince(lastLoop) > podLinkLimit(since: lastLoop),
@@ -1905,6 +1929,11 @@ extension UntetheredWatchManager: CGMManagerDelegate {
 
     /// A loop reached the pod again: the search an escalation started ends, and so does its notice.
     func podLinkRecovered(_ pump: PumpManager & ExclusiveDeviceControl) {
+        if podLinkEarlyNoticeAt != nil {
+            podLinkEarlyNoticeAt = nil
+            podFrontTry = nil
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.podLinkEarlyID])
+        }
         guard lastPodLinkReset != nil || lastPodLinkNotice != nil || handbackRequestedAt != nil else { return }
         lastPodLinkNotice = nil
         podLinkNoticeCount = 0
@@ -1933,6 +1962,51 @@ extension UntetheredWatchManager: CGMManagerDelegate {
                 Task { await WatchLogger.shared.log("⌚️ Untethered: the pod is back, the queued hand-back request is withdrawn", force: true) }
             }
         }
+    }
+
+    /// The early notice comes once two loops since the last one failed at the pod's link and this long has passed.
+    static let podLinkEarlyNoticeAfter: TimeInterval = 5 * 60
+    /// How long the notice has before the pump goes back to the phone at the shorter stall limit.
+    static let podLinkEarlyGrace: TimeInterval = 3 * 60
+    static let podLinkEarlyID = "untethered.podLinkEarly"
+
+    /// The pod keeps dropping the watch's link: the watch asks to be opened while it still has the pump. On 15 November
+    /// (19:46 to 19:56) the only notice came with the hand-back request, and the phone had the pump 4 seconds later,
+    /// before opening Trio could show whether it brings the pod back. Once per stall.
+    func checkPodLinkEarly(now: Date = Date()) {
+        guard data.session.phase == .active, pumpManager != nil, podLinkEarlyNoticeAt == nil,
+              let lastLoop = loopReference, now.timeIntervalSince(lastLoop) >= Self.podLinkEarlyNoticeAfter,
+              podLinkFailures.filter({ $0 > lastLoop }).count >= Self.podLinkDropsForEarlyHandback,
+              (podQuietUntil ?? .distantPast) <= now, handbackRequestedAt == nil
+        else { return }
+        podLinkEarlyNoticeAt = now
+        let minutes = Int(now.timeIntervalSince(lastLoop) / 60)
+        notify(
+            id: Self.podLinkEarlyID,
+            title: String(localized: "Pod Link Lost"),
+            body: String(
+                localized: "The watch keeps losing the pod's link (no loop for \(minutes) minutes). Open Trio on the watch now and keep it open for a moment. If the pod doesn't answer there either, the watch hands the pump back to the iPhone when it is nearby."
+            ),
+            asksForAction: true
+        )
+        WKInterfaceDevice.current().play(.failure)
+        Task { await WatchLogger.shared.log("⌚️ Untethered: early notice — open Trio on the watch (no loop for \(minutes) min)", force: true) }
+        // already in front: try now rather than at the next reading
+        if WKApplication.shared().applicationState == .active { retryPodInFront() }
+    }
+
+    /// Trio came to the front after the early notice: the pod is tried at once, on the newest reading, or right after
+    /// a loop in flight.
+    func retryPodInFront() {
+        guard podLinkEarlyNoticeAt != nil, data.session.phase == .active, !isBolusing,
+              (podQuietUntil ?? .distantPast) <= Date()
+        else { podFrontTry = nil; return }
+        guard !isLooping else { podFrontTry = .pending; return }
+        Task { await WatchLogger.shared.log("⌚️ Untethered: Trio in front after the early notice, trying the pod", force: true) }
+        podFrontTry = .running
+        runLoop(.podBack)
+        // the loop didn't start (`runLoop`'s own checks): nothing is being tried
+        if !isLooping { podFrontTry = nil }
     }
 
     static let podLinkID = "untethered.podLink"
