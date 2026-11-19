@@ -75,6 +75,7 @@ public extension PumpEventStored {
         /// A reading the sensor marks unreliable, for followers (LoopFollow) to show greyed; its own type, so
         /// nothing reads it as a BG check.
         case nsUnreliableGlucose = "Unreliable Glucose"
+        case nsProfileSwitch = "Profile Switch"
         case capillaryGlucose = "BG Check"
     }
 
