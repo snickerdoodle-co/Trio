@@ -1,4 +1,5 @@
 import Foundation
+import OmnipodKit
 import HealthKit
 import LoopKit
 import SwiftUI
@@ -357,11 +358,13 @@ extension UntetheredWatchManager {
         // a pod command watchOS can freeze half-way is what leaves the pod link stuck (2026-10-19 08:09,
         // 2026-10-20 02:25 and 12:11): none starts once the loop has no background time left
         guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
+        var sentTemp = false
         if let rate = determination.rate, let duration = determination.duration {
             try await pump.enactTempBasal(
                 unitsPerHour: rate.nearestDouble,
                 for: TimeInterval(truncating: duration as NSNumber) * 60
             )
+            sentTemp = true
         }
         // as the phone: no SMB on top of a bolus still running, e.g. the meal bolus just started
         if data.grant?.dosingMode == dosingMode, let units = determination.units, units > 0,
@@ -370,9 +373,40 @@ extension UntetheredWatchManager {
             guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
             guard mayDose else { throw UntetheredWatchError.noPump }
             try await pump.enactBolus(units: units.nearestDouble, automatic: true)
+            return true
         }
+        if !sentTemp { await readPodAheadOfNextWake(pump) }
         return true
     }
+
+    /// Test (20 November, first tester): a background wake that sends the pod nothing skips the pod read (its data
+    /// is under 6 minutes old), so the next wake's is 10 minutes old; when that wake changes the temp basal it needs a
+    /// read, a cancel and the new temp, 6 pod messages, and each such wake added 14 or 15 to the watchOS count that
+    /// cuts all of Trio's links near 200. Wakes of 2 or 4 messages added nothing. The quiet wake reads instead.
+    private func readPodAheadOfNextWake(_ pump: PumpManager) async {
+        guard WKApplication.shared().applicationState != .active, !loopHoldExpired, mayDose,
+              let omnipod = pump as? OmniPumpManager else { return }
+        // Only early in the wake: pod messages past ~10 s from the sensor's link-up are the ones that count toward the
+        // watchOS limit (19 November), and a read started late can be cut off half-way when the wake ends. Without a
+        // link-up time (a wake the sensor didn't start) it isn't known how late it is: no read either.
+        let sinceLinkUp = sensorLinkUpAt.map { Date().timeIntervalSince($0) }
+        guard let sinceLinkUp, sinceLinkUp < Self.quietWakeReadWithin else {
+            Task {
+                await WatchLogger.shared.log(String(
+                    format: "⌚️ Untethered: no pod read ahead of the next wake, %@ into the wake",
+                    sinceLinkUp.map { String(format: "%.1f s", $0) } ?? "unknown"
+                ))
+            }
+            return
+        }
+        _ = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
+            omnipod.readStatusIfOlder(than: 2 * 60) { continuation.resume(returning: $0) }
+        }
+    }
+
+    /// The latest point in a wake, from the sensor's link-up, at which a quiet wake still reads the pod: about 2 s of the
+    /// ~10 s watchOS gives before pod messages count toward its limit, enough for a status read over a link that is up.
+    static let quietWakeReadWithin: TimeInterval = 8
 
     /// The watch may still command the pod: the session runs (a hand-back until its last stage) and the phone isn't
     /// taking the pod back. `runLoop` checks this at the start; a dose checks it again after the waits on the pod.
@@ -973,7 +1007,7 @@ extension UntetheredWatchManager {
             $0.pendingPumpAlerts.removeAll { $0.managerIdentifier == self.pumpManager?.pluginIdentifier }
         }
         // no loop follows until the phone pairs the next pod
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [Self.notLoopingID])
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: Self.notLoopingIDs)
         store.record(
             UntetheredRecord(key: UntetheredRecord.podEndedKey, date: now, kind: .podEnded(now)),
             epoch: data.session.epoch
@@ -1384,8 +1418,24 @@ extension UntetheredWatchManager: PumpManagerDelegate {
             Task { await WatchLogger.shared.log(look ? "⌚️ Device (look): \(message)" : "⌚️ Device: \(message)", force: look) }
         }
         DispatchQueue.main.async { self.noteSensorPairingEvent(message) }
+        // the sensor's link is up: the wake's ~10 s of Bluetooth start now (G7SensorKit's G7WatchAcquisition says so
+        // only in its log)
+        if message.hasPrefix("[g7-watch] link up") {
+            let at = Date()
+            DispatchQueue.main.async { self.sensorLinkUpAt = at }
+        }
         if message.hasPrefix("Pod connected"), isSessionPump(manager as AnyObject) {
             DispatchQueue.main.async { self.loopAgainIfPodBack() }
+        }
+        // ponytail: matched on OmnipodKit's disconnect line, as the sensor's link errors above; a link OmnipodKit
+        // didn't end itself ("no reason recorded") and nothing from the pod either: watchOS ended it
+        let isSession = isSessionPump(manager as AnyObject)
+        if isSession || manager is PumpManager {
+            if message.hasPrefix("[disconnect] ours: no reason recorded"), message.contains("app in background") {
+                DispatchQueue.main.async { self.noteBackgroundLinkCut(look: !isSession) }
+            } else if message.hasPrefix("[connect] configured in") {
+                DispatchQueue.main.async { self.noteBackgroundLinkThrough() }
+            }
         }
         // ponytail: matched on G7SensorKit's log line, which is the only place it reports a link error;
         // move to a delegate call if the kit ever reports one. 14 = the peer removed the pairing: the sensor no
@@ -1458,7 +1508,7 @@ extension UntetheredWatchManager: PumpManagerDelegate {
         guard toWatch else {
             UNUserNotificationCenter.current()
                 .removePendingNotificationRequests(
-                    withIdentifiers: alerts.map { Self.notificationID($0.id) } + [Self.notLoopingID, Self.noReadingsID]
+                    withIdentifiers: alerts.map { Self.notificationID($0.id) } + Self.notLoopingIDs + [Self.noReadingsID]
                 )
             return
         }
@@ -1694,6 +1744,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
 
     /// Trio came to the front: a pairing that is due keeps it there.
     func appBecameActive() {
+        Self.logDeliveredNotifications()
         ActionNotice.clearReminders()
         watchCGMRecheckAcquisition(cgmManager)
         if isPairingSensor { keepTrioInFrontForPairing() }
@@ -1994,6 +2045,120 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         Task { await WatchLogger.shared.log("⌚️ Untethered: early notice — open Trio on the watch (no loop for \(minutes) min)", force: true) }
         // already in front: try now rather than at the next reading
         if WKApplication.shared().applicationState == .active { retryPodInFront() }
+    }
+
+    /// Cuts in a row, with no link through, that make the pattern: the watch stops retrying until the next reading.
+    static let cutPatternCount = 3
+    /// Cuts older than this don't count, nor does any cut before a link that got through.
+    static let cutPatternWindow: TimeInterval = 15 * 60
+    /// Until the next reading's wake, about 5 minutes on: that wake tries the pod once more.
+    static let cutPausePeriod: TimeInterval = 4 * 60
+    /// A force quit asked for this recently, in another run of Trio, and the cuts are back: it's the whole watch.
+    static let forceQuitAskedWithin: TimeInterval = 2 * 60 * 60
+    /// Said again at most this often while it goes on.
+    static let restartWatchRepeat: TimeInterval = 2 * 60 * 60
+    static let restartWatchID = notificationPrefix + "restartWatch"
+    static let forceQuitID = notificationPrefix + "forceQuit"
+    private static let forceQuitAskedAtKey = "untethered.forceQuitAskedAt"
+    private static let forceQuitAskedPIDKey = "untethered.forceQuitAskedPID"
+
+    /// The pod's link cut from the watch's own side right after connecting, with Trio in the background: neither
+    /// OmnipodKit nor the pod ended it. Once it starts it stays for that run of Trio (18 November: 50 minutes, every
+    /// background link; a second watch: about 7 hours, through its session and every look after), and retrying only
+    /// repeats it. After `cutPatternCount` in a row the watch stops until the next reading and lets a look go. In a
+    /// session it asks for a force quit of Trio first: a new run that links again shows the state was that run's, cuts
+    /// in the new run show it's the watch's, and only then "Restart the Watch".
+    func noteBackgroundLinkCut(look: Bool = false, now: Date = Date()) {
+        backgroundLinkCuts.append(now)
+        backgroundLinkCuts.removeAll { now.timeIntervalSince($0) > Self.cutPatternWindow }
+        let cuts = backgroundLinkCuts.count
+        guard cuts >= Self.cutPatternCount, (podCutPauseUntil ?? .distantPast) <= now else { return }
+        podCutPauseUntil = now.addingTimeInterval(Self.cutPausePeriod)
+        podRetryPending = nil
+        let pid = Int(ProcessInfo.processInfo.processIdentifier)
+        if look {
+            if let pump = lookingPump, !pump.isControlReleased {
+                lookAbandoned = true
+                pump.releaseControl()
+            }
+            Task {
+                await WatchLogger.shared.log(
+                    "⌚️ Untethered: fallback — the look's pod links cut by the watch itself right after connecting, \(cuts) in a row (pid \(pid)): letting go of the pod instead of retrying",
+                    force: true
+                )
+            }
+            return
+        }
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: background pod links cut by the watch itself right after connecting, \(cuts) in a row (pid \(pid)): no more retries until the next reading",
+                force: true
+            )
+        }
+        guard data.session.phase == .active else { return }
+        let defaults = UserDefaults.standard
+        let askedAt = defaults.object(forKey: Self.forceQuitAskedAtKey) as? Date
+        let askedPID = defaults.integer(forKey: Self.forceQuitAskedPIDKey)
+        if let askedAt, now.timeIntervalSince(askedAt) < Self.forceQuitAskedWithin, askedPID != 0, askedPID != pid {
+            // the force quit was done, and the new run is cut all the same: the watch's own state
+            defaults.removeObject(forKey: Self.forceQuitAskedAtKey)
+            defaults.removeObject(forKey: Self.forceQuitAskedPIDKey)
+            guard restartWatchNoticeAt.map({ now.timeIntervalSince($0) > Self.restartWatchRepeat }) ?? true else { return }
+            restartWatchNoticeAt = now
+            Task {
+                await WatchLogger.shared.log(
+                    "⌚️ Untethered: the cuts go on in a new run of Trio (pid \(pid); the force quit was asked in pid \(askedPID) at \(askedAt.formatted(date: .omitted, time: .standard))): the watch's state, asking for a restart of the watch",
+                    force: true
+                )
+            }
+            notify(
+                id: Self.restartWatchID,
+                title: String(localized: "Restart the Watch"),
+                body: String(
+                    localized: "Bluetooth on the watch keeps cutting the pod's link right after it connects, while Trio is in the background. A restart of the watch clears this: hold the side button, then Power Off, and turn it on again. Open Trio afterwards. Until then, opening Trio gets the pod through."
+                ),
+                asksForAction: true
+            )
+            return
+        }
+        // asked in this run already: once
+        if let askedAt, askedPID == pid, now.timeIntervalSince(askedAt) < Self.forceQuitAskedWithin { return }
+        defaults.set(now, forKey: Self.forceQuitAskedAtKey)
+        defaults.set(pid, forKey: Self.forceQuitAskedPIDKey)
+        forceQuitThroughLogged = false
+        Task { await WatchLogger.shared.log("⌚️ Untethered: asking for a force quit of Trio (pid \(pid))", force: true) }
+        notify(
+            id: Self.forceQuitID,
+            title: String(localized: "Force Quit Trio on the Watch"),
+            body: String(
+                localized: "Bluetooth on the watch keeps cutting the pod's link right after it connects, while Trio is in the background. Testing: take a sysdiagnose first if you can. Then open Trio, hold the side button until the power screen, then hold the Digital Crown until Trio closes. It starts again by itself. Until then, opening Trio gets the pod through."
+            ),
+            asksForAction: true
+        )
+    }
+
+    /// A pod link set up all the way: the cuts in a row end. The first in the background after a force quit was asked,
+    /// in a new run of Trio, says the state was the old run's.
+    func noteBackgroundLinkThrough() {
+        backgroundLinkCuts.removeAll()
+        podCutPauseUntil = nil
+        guard WKApplication.shared().applicationState != .active, !forceQuitThroughLogged,
+              let askedAt = UserDefaults.standard.object(forKey: Self.forceQuitAskedAtKey) as? Date,
+              Date().timeIntervalSince(askedAt) < Self.forceQuitAskedWithin
+        else { return }
+        let askedPID = UserDefaults.standard.integer(forKey: Self.forceQuitAskedPIDKey)
+        let pid = Int(ProcessInfo.processInfo.processIdentifier)
+        guard askedPID != 0, askedPID != pid else { return }
+        forceQuitThroughLogged = true
+        UserDefaults.standard.removeObject(forKey: Self.forceQuitAskedAtKey)
+        UserDefaults.standard.removeObject(forKey: Self.forceQuitAskedPIDKey)
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.forceQuitID])
+        Task {
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: a background pod link went through in a new run of Trio (pid \(pid); the force quit was asked in pid \(askedPID) at \(askedAt.formatted(date: .omitted, time: .standard))): the cuts belonged to the old run",
+                force: true
+            )
+        }
     }
 
     /// Trio came to the front after the early notice: the pod is tried at once, on the newest reading, or right after
@@ -2297,7 +2462,12 @@ extension UntetheredWatchManager {
         if !data.podEnded, let lastLoop = loopReference,
            now.timeIntervalSince(lastLoop) > Self.notLoopingAfter
         {
-            alarm("loop", title: Self.notLoopingTitle, body: Self.notLoopingBody, every: 30 * 60)
+            alarm(
+                "loop",
+                title: Self.notLoopingTitle,
+                body: Self.notLoopingBody(minutes: Int(now.timeIntervalSince(lastLoop) / 60)),
+                every: 30 * 60
+            )
         }
         // looping on the phone's readings hides a broken link of the watch's own: said after 20 minutes
         if readingsFromPhoneSince != nil, let own = ownReadingAt, now.timeIntervalSince(own) > Self.ownReadingWarnAfter {
@@ -2358,22 +2528,70 @@ extension UntetheredWatchManager {
 
     static let notLoopingID = "untethered.loop"
     private static let notLoopingAfter: TimeInterval = 20 * 60
-    private static var notLoopingTitle: String { String(localized: "Not Looping") }
-    private static var notLoopingBody: String { String(localized: "The watch hasn't looped for 20 minutes.") }
+    /// The same alarm again this long after the first, booked with it: a watch app that froze, crashed or is being
+    /// updated can't sound anything itself, so only what is booked ahead reaches the wrist (18 November: the watch
+    /// app stuck in an update, the phone not dosing, nothing heard from the watch for 70 minutes).
+    private static let notLoopingRepeats: [TimeInterval] = [15 * 60, 30 * 60]
+    /// The first alarm and its repeats, for taking them all back.
+    static var notLoopingIDs: [String] {
+        [notLoopingID] + notLoopingRepeats.indices.map { notLoopingID + ".again\($0 + 1)" }
+    }
 
-    /// Booked 20 minutes ahead after every loop, and at the takeover: it sounds even when nothing wakes the watch app
-    /// to check. The next loop books it again; a hand-back or a pod ended on the watch takes it back.
+    private static var notLoopingTitle: String { String(localized: "Not Looping") }
+    private static func notLoopingBody(minutes: Int) -> String {
+        String(
+            localized: "The watch hasn't looped for \(minutes) minutes. Open Trio on the watch. If it doesn't open or still doesn't loop, take the pump back on the iPhone."
+        )
+    }
+
+    /// Booked 20 minutes ahead after every loop, and at the takeover, with its repeats 35 and 50 minutes ahead: they
+    /// sound even when nothing wakes the watch app to check, or the app can't run at all. The next loop books them
+    /// again; a hand-back or a pod ended on the watch takes them back.
     func scheduleNotLoopingAlert(from lastLoop: Date) {
         notify(
             id: Self.notLoopingID,
             title: Self.notLoopingTitle,
-            body: Self.notLoopingBody,
+            body: Self.notLoopingBody(minutes: Int(Self.notLoopingAfter / 60)),
             after: lastLoop.addingTimeInterval(Self.notLoopingAfter).timeIntervalSinceNow
         )
+        for (index, extra) in Self.notLoopingRepeats.enumerated() {
+            let after = Self.notLoopingAfter + extra
+            // a repeat already past isn't sounded at once: the first, or the running app's own alarm, has said it
+            guard lastLoop.addingTimeInterval(after) > Date() else { continue }
+            notify(
+                id: Self.notLoopingID + ".again\(index + 1)",
+                title: Self.notLoopingTitle,
+                body: Self.notLoopingBody(minutes: Int(after / 60)),
+                after: lastLoop.addingTimeInterval(after).timeIntervalSinceNow
+            )
+        }
     }
 
     /// Every untethered notification's identifier starts with it, so they show with Trio open on the wrist too.
     static let notificationPrefix = "untethered."
+
+    /// Delivered notifications already in the log, by identifier and delivery time.
+    private static var loggedDeliveries: Set<String> = []
+
+    /// Each of our notifications the watch shows, once, with the time it came: whether "Not Looping" sounded while the
+    /// app couldn't run is seen only here (19 November: the watch in a Faraday bag, the planned alert not in the log).
+    /// Only those still on the screen are listed, so it runs at every wake and when Trio comes to the front.
+    static func logDeliveredNotifications() {
+        UNUserNotificationCenter.current().getDeliveredNotifications { delivered in
+            let ours = delivered
+                .filter { $0.request.identifier.hasPrefix(Self.notificationPrefix) }
+                .sorted { $0.date < $1.date }
+            DispatchQueue.main.async {
+                for notification in ours {
+                    let key = notification.request.identifier + "@\(notification.date.timeIntervalSince1970)"
+                    guard Self.loggedDeliveries.insert(key).inserted else { continue }
+                    let time = notification.date.formatted(date: .omitted, time: .standard)
+                    let title = notification.request.content.title
+                    Task { await WatchLogger.shared.log("⌚️ Notification shown at \(time): \(title)", force: true) }
+                }
+            }
+        }
+    }
 
     private func alarm(_ kind: String, title: String, body: String, every interval: TimeInterval) {
         guard (Self.lastAlarm[kind] ?? .distantPast).addingTimeInterval(interval) < Date() else { return }
@@ -2387,7 +2605,8 @@ extension UntetheredWatchManager {
     /// The alarms that mean nobody is looping or the user is in danger: critical with Settings › Notifications ›
     /// Critical Alerts on, so they get through Silent Mode and Focus on the wrist without the phone too.
     static let criticalAlarmIDs: Set<String> = [
-        notificationPrefix + "urgentLow", notLoopingID, noReadingsID, podLinkID
+        notificationPrefix + "urgentLow", notLoopingID, notLoopingID + ".again1", notLoopingID + ".again2", noReadingsID,
+        podLinkID
     ]
     /// Who doses changed: through Focus and kept on the screen, and the log says it was booked (7 November: two
     /// takeovers, and neither "Watch Took Over" was noticed).
@@ -2806,6 +3025,8 @@ extension UntetheredWatchManager {
     /// asked for by the first tester).
     func loopAgainIfPodBack(now: Date = Date()) {
         guard let pending = podRetryPending else { return }
+        // cut right after connecting, again and again: the next reading tries (`noteBackgroundLinkCut`)
+        guard (podCutPauseUntil ?? .distantPast) <= now else { return }
         let newestGlucose = data.glucose.map(\.dateString).max() ?? .distantPast
         // too late, or a newer reading loops anyway
         guard now.timeIntervalSince(pending.failedAt) < Self.podRetryWindow, newestGlucose <= pending.glucose,

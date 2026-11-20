@@ -83,6 +83,9 @@ import WatchKit
     @ObservationIgnored var startCopyIssuedAt: Date?
     /// watchOS ended the running loop's background time: it starts no further pod command.
     @ObservationIgnored var loopHoldExpired = false
+    /// When the sensor's link last came up: a background wake has about 10 s of Bluetooth from then; pod messages
+    /// after that count toward a watchOS limit that cuts all of Trio's links (sysdiagnose, 19 November).
+    @ObservationIgnored var sensorLinkUpAt: Date?
     /// A treatment came in while a loop ran; its determination follows.
     @ObservationIgnored var isDeterminationPending = false
     /// A mode changed while a loop ran; its constrained determination and enactment follow.
@@ -115,6 +118,16 @@ import WatchKit
     @ObservationIgnored var podLinkNoticeCount = 0
     /// When this stall's early notice asked to open Trio on the watch (`checkPodLinkEarly`); nil once a loop gets through.
     @ObservationIgnored var podLinkEarlyNoticeAt: Date?
+    /// The session pod's background links cut from the watch's own side right after connecting, newest last
+    /// (`noteBackgroundLinkCut`); emptied by a link that gets through.
+    @ObservationIgnored var backgroundLinkCuts: [Date] = []
+    /// When "Restart the Watch" was last said.
+    @ObservationIgnored var restartWatchNoticeAt: Date?
+    /// Background links cut right after connecting, again and again: no retry of the pod before this
+    /// (`noteBackgroundLinkCut`).
+    @ObservationIgnored var podCutPauseUntil: Date?
+    /// The first link through after a force quit was asked is logged once.
+    @ObservationIgnored var forceQuitThroughLogged = false
     /// The pod tried with Trio in front after that notice: waiting for a loop in flight, or running.
     @ObservationIgnored var podFrontTry: PodFrontTry?
     enum PodFrontTry { case pending, running }
@@ -1100,6 +1113,7 @@ import WatchKit
     static let sessionRefreshDelay: TimeInterval = 7 * 60
 
     func recheckCGM() {
+        Self.logDeliveredNotifications()
         watchCGMRecheckAcquisition(cgmManager)
         // on a wake with the phone away, too: the phone takes it once it is back
         WatchState.shared.reportBatteryIfChanged()
@@ -2271,7 +2285,14 @@ extension UntetheredWatchManager {
         let lookLine = "⌚️ Untethered: fallback look — took the pod \(offset(started)) after the watch's reading, " +
             "\(readAt != nil ? "read it at \(offset(readAt))" : "no answer"), let go at \(offset(Date()))"
         Task { await WatchLogger.shared.log(lookLine, force: true) }
-        if lookAbandoned { return .notReached("watchOS ended the background time; the watch let go of the pod") }
+        if lookAbandoned {
+            // let go after links cut right after connecting (`noteBackgroundLinkCut`), or watchOS ended its time
+            let cut = (podCutPauseUntil ?? .distantPast) > Date()
+            return .notReached(
+                cut ? "the pod's links cut by the watch itself right after connecting; the watch let go of the pod"
+                    : "watchOS ended the background time; the watch let go of the pod"
+            )
+        }
         guard read != nil else {
             return .notReached("no answer in \(Int(Date().timeIntervalSince(started))) s")
         }
