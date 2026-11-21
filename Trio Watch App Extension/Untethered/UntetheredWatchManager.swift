@@ -83,9 +83,9 @@ import WatchKit
     @ObservationIgnored var startCopyIssuedAt: Date?
     /// watchOS ended the running loop's background time: it starts no further pod command.
     @ObservationIgnored var loopHoldExpired = false
-    /// When the sensor's link last came up: a background wake has about 10 s of Bluetooth from then; pod messages
-    /// after that count toward a watchOS limit that cuts all of Trio's links (sysdiagnose, 19 November).
-    @ObservationIgnored var sensorLinkUpAt: Date?
+    /// The newest reading the watch took from the sensor itself in watch mode (`cgmManager(_:hasNew:)`), for the
+    /// sensor details' "Watch BG": in watch mode the sensor's readings come through G7SensorKit, not the watch's reader.
+    var ownSessionReadingDate: Date?
     /// A treatment came in while a loop ran; its determination follows.
     @ObservationIgnored var isDeterminationPending = false
     /// A mode changed while a loop ran; its constrained determination and enactment follow.
