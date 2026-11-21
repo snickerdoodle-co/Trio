@@ -71,12 +71,22 @@ extension UntetheredWatchManager {
                 if self.podFrontTry == .pending { self.retryPodInFront() }
                 self.endLoopHold(releaseHold)
             }
-            // the pod only once the sensor's link is closed (see `waitForSensorQuiet`)
+            // The pod at once after the reading, while the sensor's link and its wake are still up, as Jeremy Barnum's
+            // Sport Mode does (first tester's branch since 19 November): waiting for the sensor's link to close made every
+            // background pod connection a new one, late in the wake. After a gap in the watch's loops (one missed reading
+            // or more) it still waits, which gives a take-back the phone sent meanwhile time to arrive first (second
+            // tester, 21 November: back from 18 min out of reach, the watch reached the pod seconds before it).
             if trigger == .newGlucose {
-                await self.waitForSensorQuiet()
-                Self.trace("sensor link quiet, to the pod")
-                // the session may have ended meanwhile (2026-10-23 08:25:46: a loop ran on after the hand-back)
-                guard self.isActive else { return }
+                let lastLoop = data.lastLoopDate ?? .distantPast
+                if Date().timeIntervalSince(lastLoop) < 11 * 60 {
+                    let sensorLink = watchCGMIsConnected(self.cgmManager) ? "still open" : "closed"
+                    Task { await WatchLogger.shared.log("⌚️ Untethered: pod at once after the reading (sensor link \(sensorLink))") }
+                } else {
+                    await self.waitForSensorQuiet()
+                    Self.trace("sensor link quiet, to the pod")
+                    // the session may have ended meanwhile (2026-10-23 08:25:46: a loop ran on after the hand-back)
+                    guard self.isActive else { return }
+                }
             }
             // the pod read is a pod command too: none without background time left (see `enact`)
             var explained = true
@@ -386,27 +396,10 @@ extension UntetheredWatchManager {
     private func readPodAheadOfNextWake(_ pump: PumpManager) async {
         guard WKApplication.shared().applicationState != .active, !loopHoldExpired, mayDose,
               let omnipod = pump as? OmniPumpManager else { return }
-        // Only early in the wake: pod messages past ~10 s from the sensor's link-up are the ones that count toward the
-        // watchOS limit (19 November), and a read started late can be cut off half-way when the wake ends. Without a
-        // link-up time (a wake the sensor didn't start) it isn't known how late it is: no read either.
-        let sinceLinkUp = sensorLinkUpAt.map { Date().timeIntervalSince($0) }
-        guard let sinceLinkUp, sinceLinkUp < Self.quietWakeReadWithin else {
-            Task {
-                await WatchLogger.shared.log(String(
-                    format: "⌚️ Untethered: no pod read ahead of the next wake, %@ into the wake",
-                    sinceLinkUp.map { String(format: "%.1f s", $0) } ?? "unknown"
-                ))
-            }
-            return
-        }
         _ = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
             omnipod.readStatusIfOlder(than: 2 * 60) { continuation.resume(returning: $0) }
         }
     }
-
-    /// The latest point in a wake, from the sensor's link-up, at which a quiet wake still reads the pod: about 2 s of the
-    /// ~10 s watchOS gives before pod messages count toward its limit, enough for a status read over a link that is up.
-    static let quietWakeReadWithin: TimeInterval = 8
 
     /// The watch may still command the pod: the session runs (a hand-back until its last stage) and the phone isn't
     /// taking the pod back. `runLoop` checks this at the start; a dose checks it again after the waits on the pod.
@@ -1418,12 +1411,6 @@ extension UntetheredWatchManager: PumpManagerDelegate {
             Task { await WatchLogger.shared.log(look ? "⌚️ Device (look): \(message)" : "⌚️ Device: \(message)", force: look) }
         }
         DispatchQueue.main.async { self.noteSensorPairingEvent(message) }
-        // the sensor's link is up: the wake's ~10 s of Bluetooth start now (G7SensorKit's G7WatchAcquisition says so
-        // only in its log)
-        if message.hasPrefix("[g7-watch] link up") {
-            let at = Date()
-            DispatchQueue.main.async { self.sensorLinkUpAt = at }
-        }
         if message.hasPrefix("Pod connected"), isSessionPump(manager as AnyObject) {
             DispatchQueue.main.async { self.loopAgainIfPodBack() }
         }
@@ -2192,6 +2179,11 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         guard isActive, case let .newData(samples) = readingResult, !samples.isEmpty else { return }
         Self.trace("reading in: \(samples.count) sample(s), newest from \(samples.map(\.date).max()?.formatted(date: .omitted, time: .standard) ?? "-")")
         sensorPairingDone()
+        if let newest = samples.filter({ !$0.wasUserEntered }).map(\.date).max() {
+            DispatchQueue.main.async {
+                if newest > (self.ownSessionReadingDate ?? .distantPast) { self.ownSessionReadingDate = newest }
+            }
+        }
         takeReadings(samples.filter { !$0.wasUserEntered }.map {
             SessionReading(
                 date: $0.date,
