@@ -2669,7 +2669,6 @@
 		5A0A11000000000000000112 /* SettingsAnalysisDetectors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsAnalysisDetectors.swift; sourceTree = "<group>"; };
 		5A0A11000000000000000113 /* SettingsAnalysisDetectorsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsAnalysisDetectorsTests.swift; sourceTree = "<group>"; };
 		5A0A11000000000000000110 /* SettingsAnalysisChecksTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsAnalysisChecksTests.swift; sourceTree = "<group>"; };
-8b91c87305abe99e68c3b8c56b73ba55bd8e89df
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
