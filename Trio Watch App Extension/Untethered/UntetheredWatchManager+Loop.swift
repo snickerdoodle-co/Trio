@@ -222,6 +222,11 @@ extension UntetheredWatchManager {
             if !self.loopHoldExpired, self.isActive {
                 await self.uploadToNightscout(forNightscout, grant: grant)
             }
+            // EJM0's idea (EJM0/Trio a418bdc): nothing more goes to the pod this wake, so its link drops now instead of
+            // idling through OmnipodKit's 4 s hold, past the ~10 s of Bluetooth watchOS gives a background wake
+            if enacts, WKApplication.shared().applicationState != .active, !self.isKeptAwake {
+                (self.pumpManager as? OmniPumpManager)?.releaseLink()
+            }
             self.refresh()
             self.streamRecords()
             self.publishToWatchState()
@@ -369,7 +374,9 @@ extension UntetheredWatchManager {
         // 2026-10-20 02:25 and 12:11): none starts once the loop has no background time left
         guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
         var sentTemp = false
-        if let rate = determination.rate, let duration = determination.duration {
+        if let rate = determination.rate, determination.duration != nil, tempAlreadyRunning(rate.nearestDouble, pump: pump) {
+            // not sent again; an SMB after it then goes in this wake
+        } else if let rate = determination.rate, let duration = determination.duration {
             try await pump.enactTempBasal(
                 unitsPerHour: rate.nearestDouble,
                 for: TimeInterval(truncating: duration as NSNumber) * 60
@@ -386,6 +393,21 @@ extension UntetheredWatchManager {
             return true
         }
         if !sentTemp { await readPodAheadOfNextWake(pump) }
+        return true
+    }
+
+    /// EJM0's idea (EJM0/Trio a418bdc): in a background wake, a temp at the rate already running with at least 15
+    /// minutes left isn't sent again when it wouldn't end by about 9 s after the sensor's link-up. oref re-sets a
+    /// running zero temp every 5 to 10 minutes as its planned length changes, and those late pod messages count
+    /// toward the watchOS limit that cuts all of Trio's links near 200. The next wake can still extend it.
+    /// This branch doesn't note the sensor's link-up, so any background wake counts as late.
+    private func tempAlreadyRunning(_ rate: Double, pump: PumpManager) -> Bool {
+        guard WKApplication.shared().applicationState != .active, !isKeptAwake,
+              case let .tempBasal(dose) = pump.status.basalDeliveryState,
+              dose.endDate.timeIntervalSinceNow >= 15 * 60, abs(dose.unitsPerHour - rate) < 0.001
+        else { return false }
+        let left = Int(dose.endDate.timeIntervalSinceNow / 60)
+        Task { await WatchLogger.shared.log("⌚️ Untethered: temp \(rate) U/h already running (\(left) min left), not sent again", force: true) }
         return true
     }
 

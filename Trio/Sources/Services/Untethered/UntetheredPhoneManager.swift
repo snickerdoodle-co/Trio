@@ -108,6 +108,15 @@ enum UntetheredGate {
 
     static let watchRecordsWait: TimeInterval = 2 * 60
 
+    /// Past that wait, until the watch's records are in (at most 30 minutes): the iPhone loops, but gives no SMB on an
+    /// insulin on board that may lack the watch's last doses. 23 November, first tester: the watch was out of the
+    /// phone's reach, its records came 8 minutes after the take-back, and the iPhone looped at 5 minutes on records
+    /// 0.24 U short (it set a zero temp).
+    static var watchRecordsMissing: Bool {
+        guard let point = state.audit else { return false }
+        return Date().timeIntervalSince(point.end) < 30 * 60
+    }
+
     /// Every change reaches the screens, whichever path made it. While the saved state is locked a change stays in
     /// memory only; the saved state, once read, is what counts.
     @discardableResult static func update<T>(_ change: (inout UntetheredPhoneState) -> T) -> T {
@@ -1656,7 +1665,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         var attempts = 0
         var bannerShown = false
         while state.pumpReturnPending, !state.podEndedOnWatch, !podChanged(since: returningPod),
-              !(await odometer.refreshDeliveredUnits())
+              await odometer.refreshDeliveredUnits() == false
         {
             attempts += 1
             debug(.watch, "Untethered: the pump did not answer yet (attempt \(attempts)), retrying")

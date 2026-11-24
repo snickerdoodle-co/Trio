@@ -996,7 +996,11 @@ final class BaseAPSManager: APSManager, Injectable {
         }
 
         // only perform a bolus if smbToDeliver is > 0
-        if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending {
+        if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending,
+           UntetheredGate.watchRecordsMissing
+        {
+            info(.loop, "SMB \(smb) U not given: the watch's records aren't in yet (untethered)")
+        } else if let smb = smbToDeliver, smb.compare(NSDecimalNumber(value: 0)) == .orderedDescending {
             try await performBolus(pump: pump, smbToDeliver: smb)
             PhoneLastDose.note()
             info(.loop, "SMB enacted: \(smb) U")

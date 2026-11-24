@@ -1916,11 +1916,12 @@ extension UntetheredWatchManager {
         return String(localized: "The watch's battery is at \(battery) %. Watch mode starts from 20 %. Charge the watch first.")
     }
 
-    /// How far the low-battery steps went this session: 1 warned at 15 %, 2 told to take back on the iPhone, 3 handed back.
+    /// How far the low-battery steps went this session: 1 warned at 15 %, 2 told to take back on the iPhone, 3 handed back,
+    /// 4 last warning at 5 % with the iPhone still out of reach.
     private static var batteryStep = 0
 
     /// At 15 % a warning; at 10 % the watch hands back while the iPhone is in reach, or else says to take the pump
-    /// back on the iPhone (and hands back once it is in reach).
+    /// back on the iPhone (and hands back once it is in reach); at 5 % with the iPhone still out of reach, a last warning.
     func checkBattery() {
         guard data.session.phase == .active, let battery = Self.batteryPercent, battery <= 15 else { return }
         if battery > 10 {
@@ -1942,6 +1943,15 @@ extension UntetheredWatchManager {
                 body: String(localized: "The watch's battery is at \(battery) %. The watch hands the pump back to the iPhone.")
             )
             end()
+        } else if battery <= 5 {
+            guard Self.batteryStep < 4 else { return }
+            Self.batteryStep = 4
+            Task { await WatchLogger.shared.log("⌚️ Untethered: battery \(battery) %, last warning", force: true) }
+            notify(
+                id: Self.notificationPrefix + "battery",
+                title: String(localized: "Watch Battery Almost Empty"),
+                body: String(localized: "The watch's battery is at \(battery) %. When it runs out the watch stops looping and the pod goes back to the scheduled basal within 30 minutes. Take the pump back on the iPhone or charge the watch.")
+            )
         } else if Self.batteryStep < 2 {
             Self.batteryStep = 2
             Task { await WatchLogger.shared.log("⌚️ Untethered: battery \(battery) %, the iPhone is out of reach", force: true) }

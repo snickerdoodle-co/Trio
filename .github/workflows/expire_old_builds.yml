@@ -1,0 +1,38 @@
+name: Expire Old TestFlight Builds
+run-name: Expire Old TestFlight Builds (keep ${{ inputs.keep }}${{ inputs.dry_run == 'true' && ', dry run' || '' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Number of most recent builds to keep (all older, non-expired builds get expired)"
+        required: false
+        default: "10"
+      dry_run:
+        description: "Dry run -- list what would be expired without actually expiring anything"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  expire:
+    name: Expire old builds
+    runs-on: macos-26
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Install Project Dependencies
+        run: bundle install
+
+      # Sync the GitHub runner clock with the Windows time server (workaround as suggested in https://github.com/actions/runner/issues/2996)
+      - name: Sync clock
+        run: sudo sntp -sS time.windows.com
+
+      - name: Expire old TestFlight builds
+        run: bundle exec fastlane expire_old_builds keep:"${{ inputs.keep }}" dry_run:"${{ inputs.dry_run }}"
+        env:
+          TEAMID: ${{ secrets.TEAMID }}
+          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
+          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
+          FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}

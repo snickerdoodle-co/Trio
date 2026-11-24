@@ -413,7 +413,8 @@ struct UntetheredStatusView: View {
                         Label("Discard Pod", systemImage: "trash")
                     }
                     .tint(.red)
-                } else {
+                } else if watchPodNeedsReplacing(manager.pumpManager) {
+                    // dnzxy's idea: only for a pod that is done (alarm, empty, occluded, expired); pod changes are the phone's
                     Button(role: .destructive) { confirmDeactivate = true } label: {
                         Label("Deactivate Pod", systemImage: "xmark.circle")
                     }

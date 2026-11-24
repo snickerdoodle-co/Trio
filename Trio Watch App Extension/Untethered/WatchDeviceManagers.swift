@@ -100,6 +100,12 @@ func watchCGMExpiresAt(_ manager: CGMManager?) -> Date? {
     return g7.sensorEndsAt ?? g7.sensorExpiresAt
 }
 
+/// Whether the pod is done and wants replacing (faulted, out of insulin, or past its 72 h expiry): only then
+/// does the watch offer Deactivate Pod.
+func watchPodNeedsReplacing(_ pump: PumpManager?) -> Bool {
+    (pump as? OmniPumpManager)?.podNeedsReplacing ?? false
+}
+
 /// Deactivates and forgets the pod, as the phone's deactivate screen does; false for a pump this can't do.
 func watchDeactivatePod(_ pump: PumpManager, completion: @escaping (Error?) -> Void) -> Bool {
     guard let omni = pump as? OmniPumpManager else { return false }

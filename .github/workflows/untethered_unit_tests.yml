@@ -3,17 +3,22 @@ name: Untethered unit tests
 # The algorithm package's tests (swift test), including the untethered ones, for this fork's own branches.
 # nightscout/Trio's "Automated unit tests" runs only in nightscout's repository, so this one runs here:
 # by itself after every push that changes the algorithm, untethered mode or its tests, and by hand from
-# Actions › Untethered unit tests › Run workflow (on a branch that has this file). The app build is untouched.
+# Actions › Untethered unit tests › Run workflow. GitHub shows that button only when this file is also on the
+# default branch (dev here, which doesn't have it): otherwise a push that touches this file starts a run.
+# The app build is untouched.
 
 on:
   push:
     branches:
+      - feature/untethered-exposed
       - feature/untethered-fallback
       - feature/untethered-fallback-ns
       - feature/untethered-fallback-ns-g7next
+      - feature/untethered-kk
+      - feature/untethered-kk-boost
+      - feature/untethered-kk-podtest
       - feature/untethered-pr-plus
       - feature/untethered-pr-plus-next
-      - feature/untethered-pr-plus-next-ns
       - feature/untethered-pr-plus-ns
       - feature/untethered-t3
       - feature/untethered-t3-exposed

@@ -110,6 +110,7 @@ trailingClosures \
 --exclude LoopKit \
 --exclude LibreTransmitter \
 --exclude G7SensorKit \
+--exclude "Trio Watch App Extension/G7Direct/G7SensorKit" \
 --exclude dexcom-share-client-swift \
 --exclude CGMBLEKit \
 --exclude RileyLinkKit \
