@@ -136,40 +136,124 @@ struct TrioWatchComplicationEntryView: View {
 }
 
 #if os(watchOS)
-    /// Corner Complication
+    /// Corner Complication: the newest glucose in the corner, its arrow and who has the pump along the edge.
     struct TrioAccessoryCornerView: View {
         var entry: TrioWatchComplicationProvider.Entry
 
         var body: some View {
-            Text("")
-                .widgetCurvesContent()
-                .widgetLabel {
-                    Text(entry.data?.untethered == true ? "Trio ⌚︎" : "Trio")
+            Group {
+                if let data = entry.data, let latest = data.points.last {
+                    let isStale = entry.date.timeIntervalSince(latest.date) > staleAfter
+                    Text(complicationValue(latest.value, isMmol: data.isMmol))
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .strikethrough(isStale)
+                        .minimumScaleFactor(0.5)
+                        .foregroundStyle(isStale ? Color.secondary : complicationColor(latest, data))
+                        .widgetCurvesContent()
+                        .widgetLabel {
+                            Text("\(complicationArrow(isStale ? nil : data.trend)) \(Image(systemName: pumpHolderSymbol(data, date: entry.date)))")
+                        }
+                } else {
+                    Text("")
+                        .widgetCurvesContent()
+                        .widgetLabel { Text("Trio") }
                 }
-                .widgetBackground(backgroundView: Color.clear)
+            }
+            .widgetBackground(backgroundView: Color.clear)
         }
     }
 #endif
 
-/// Circular Complication
+/// Circular Complication: the newest glucose with its arrow, and who has the pump (the watch in watch mode, else
+/// the phone); the Trio icon until the watch app has stored a reading.
 struct TrioAccessoryCircularView: View {
     var entry: TrioWatchComplicationProvider.Entry
+    @Environment(\.widgetRenderingMode) private var renderingMode
 
     var body: some View {
-        Image("ComplicationIcon")
-            .resizable()
-            .widgetAccentable()
-            .overlay(alignment: .bottomTrailing) {
-                if entry.data?.sensorWarning == true {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.yellow)
+        Group {
+            if let data = entry.data, let latest = data.points.last {
+                let isStale = entry.date.timeIntervalSince(latest.date) > staleAfter
+                ZStack {
+                    AccessoryWidgetBackground()
+                    VStack(spacing: -1) {
+                        Text(complicationValue(latest.value, isMmol: data.isMmol))
+                            .font(.system(size: 18, weight: .semibold, design: .rounded))
+                            .strikethrough(isStale)
+                            .minimumScaleFactor(0.5)
+                            .lineLimit(1)
+                            .foregroundStyle(isStale ? Color.secondary : complicationColor(latest, data))
+                            .widgetAccentable()
+                        HStack(spacing: 2) {
+                            Text(complicationArrow(isStale ? nil : data.trend))
+                                .font(.system(size: 12, weight: .semibold))
+                            PumpHolderSymbol(data: data, date: entry.date, size: 10, isFullColor: renderingMode == .fullColor)
+                            if data.sensorWarning == true {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(renderingMode == .fullColor ? Color.yellow : Color.primary)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 2)
                 }
+            } else {
+                Image("ComplicationIcon")
+                    .resizable()
+                    .widgetAccentable()
             }
-            .overlay(alignment: .bottomLeading) {
-                UntetheredBadge(data: entry.data, date: entry.date, size: 12)
-            }
-            .widgetBackground(backgroundView: Color.clear)
+        }
+        .widgetBackground(backgroundView: Color.clear)
+    }
+}
+
+/// Who has the pump: the watch symbol in watch mode (orange once late, `UntetheredBadge`), else the phone.
+struct PumpHolderSymbol: View {
+    let data: TrioComplicationData?
+    let date: Date
+    var size: CGFloat = 10
+    var isFullColor = true
+
+    var body: some View {
+        if data?.untethered == true {
+            UntetheredBadge(data: data, date: date, size: size, isFullColor: isFullColor)
+        } else {
+            Image(systemName: "iphone")
+                .font(.system(size: size, weight: .semibold))
+                .widgetAccentable()
+                .accessibilityLabel("The iPhone has the pump")
+        }
+    }
+}
+
+/// The symbol's name for a text label (the corner's edge): as `PumpHolderSymbol`.
+func pumpHolderSymbol(_ data: TrioComplicationData, date: Date) -> String {
+    guard let lateAt = data.untetheredLateAt else { return "iphone" }
+    return date >= lateAt ? "exclamationmark.applewatch" : "applewatch"
+}
+
+func complicationValue(_ value: Double, isMmol: Bool) -> String {
+    value.formatted(.number.precision(.fractionLength(isMmol ? 1 : 0)))
+}
+
+/// The color the watch app stored for the reading (Trio's static or dynamic scheme), else by range.
+func complicationColor(_ point: TrioComplicationData.Point, _ data: TrioComplicationData) -> Color {
+    if let hex = point.color, let stored = Color(hex: hex) { return stored }
+    if point.value < data.low { return .red }
+    if point.value > data.high { return .yellow }
+    return .green
+}
+
+func complicationArrow(_ trend: String?) -> String {
+    switch trend {
+    case "DoubleUp": return "⇈"
+    case "SingleUp": return "↑"
+    case "FortyFiveUp": return "↗"
+    case "Flat": return "→"
+    case "FortyFiveDown": return "↘"
+    case "SingleDown": return "↓"
+    case "DoubleDown": return "⇊"
+    default: return ""
     }
 }
 
@@ -278,30 +362,13 @@ struct TrioAccessoryRectangularView: View {
         isFullColor ? color.opacity(0.8) : Color.primary.opacity(0.5)
     }
 
-    private func format(_ value: Double, isMmol: Bool) -> String {
-        value.formatted(.number.precision(.fractionLength(isMmol ? 1 : 0)))
-    }
+    private func format(_ value: Double, isMmol: Bool) -> String { complicationValue(value, isMmol: isMmol) }
 
-    /// The color the watch app stored for the reading (Trio's static or dynamic scheme), else by range.
     private func color(_ point: TrioComplicationData.Point, _ data: TrioComplicationData) -> Color {
-        if let hex = point.color, let stored = Color(hex: hex) { return stored }
-        if point.value < data.low { return .red }
-        if point.value > data.high { return .yellow }
-        return .green
+        complicationColor(point, data)
     }
 
-    private func arrow(_ trend: String?) -> String {
-        switch trend {
-        case "DoubleUp": return "⇈"
-        case "SingleUp": return "↑"
-        case "FortyFiveUp": return "↗"
-        case "Flat": return "→"
-        case "FortyFiveDown": return "↘"
-        case "SingleDown": return "↓"
-        case "DoubleDown": return "⇊"
-        default: return ""
-        }
-    }
+    private func arrow(_ trend: String?) -> String { complicationArrow(trend) }
 }
 
 // MARK: - Widget Configuration
@@ -314,7 +381,7 @@ struct TrioAccessoryRectangularView: View {
             TrioWatchComplicationEntryView(entry: entry)
         }
         .configurationDisplayName("Trio")
-        .description("Glucose and the last 3 hours in the wide slot; the Trio icon in the others")
+        .description("Glucose and the last 3 hours in the wide slot; glucose, its arrow and who has the pump in the others")
         .supportedFamilies(supportedFamilies)
     }
 
