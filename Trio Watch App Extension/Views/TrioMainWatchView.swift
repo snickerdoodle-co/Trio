@@ -11,6 +11,8 @@ struct TrioMainWatchView: View {
     @Environment(\.scenePhase) private var glanceScenePhase
     @State private var state = WatchState.shared
     @State private var untethered = UntetheredWatchManager.shared
+    /// Watch mode's sheet, from a long press on the bubble.
+    @State private var showWatchModeSheet = false
 
     // Pages in order: bubble, chart, devices (pump and sensor lifetime), alarm snooze, untethered mode's status page
     // (start, hand back, history, the log), the watch's own G7 reader (its switch), and last, while it loops, the
@@ -150,6 +152,12 @@ struct TrioMainWatchView: View {
                             rotationDegrees: rotationDegrees,
                             isWatchStateDated: isReadingDated || isSessionUnreachable
                         )
+                    }
+                    // watch mode starts here (25 November: it belongs to the watch); a long press, then the crown
+                    .onLongPressGesture(minimumDuration: 0.5) {
+                        guard showsUntethered else { return }
+                        WKInterfaceDevice.current().play(.click)
+                        showWatchModeSheet = true
                     }
 
                     // a pending meal-time reminder: a small alarm clock right of the bubble; a tap shows the time left
@@ -320,6 +328,9 @@ struct TrioMainWatchView: View {
                     // reset the conditional navigation flag when opening
                     continueToBolus = false
                 }
+            }
+            .sheet(isPresented: $showWatchModeSheet) {
+                WatchModeSheet(manager: untethered) { currentPage = statusPage }
             }
             .sheet(isPresented: $showingOverrideSheet) {
                 OverridePresetsView(

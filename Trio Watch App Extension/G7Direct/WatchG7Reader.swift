@@ -30,6 +30,8 @@ import WatchKit
 
     /// The watch's own key for the sensor, from its own pairing.
     private(set) var hasWatchKey: Bool
+    /// The sensor has answered the watch with its present key: a start without the iPhone can read it.
+    private(set) var sensorAnswered: Bool
 
     // MARK: - Live state
 
@@ -122,6 +124,7 @@ import WatchKit
         static let low = "watchG7.lowMgDL"
         static let high = "watchG7.highMgDL"
         static let sharedKey = "watchG7.sharedKey"
+        static let sensorAnswered = "watchG7.sensorAnswered"
         static let peripheralIdentifier = "watchG7.peripheralIdentifier"
         static let history = "watchG7.history"
         static let log = "watchG7.log"
@@ -150,6 +153,7 @@ import WatchKit
         highMgDL = defaults.object(forKey: Key.high) as? Double
         sharedKey = defaults.data(forKey: Key.sharedKey)
         hasWatchKey = defaults.data(forKey: Key.sharedKey) != nil
+        sensorAnswered = defaults.bool(forKey: Key.sensorAnswered)
         peripheralIdentifier = defaults.string(forKey: Key.peripheralIdentifier).flatMap(UUID.init(uuidString:))
         lastPhoneContact = defaults.object(forKey: Key.lastPhoneContact) as? Date
         phoneGlucoseDate = defaults.object(forKey: Key.phoneGlucoseDate) as? Date
@@ -280,14 +284,14 @@ import WatchKit
         }
         if isStandingAside {
             return String(
-                localized: "Paused: untethered mode reads the sensor",
-                comment: "Watch G7 status: untethered mode holds the sensor"
+                localized: "Paused: watch mode reads the sensor",
+                comment: "Watch G7 status: watch mode holds the sensor"
             )
         }
         if isReconnecting, !isConnected {
             return String(
                 localized: "Reconnecting to the sensor…",
-                comment: "Watch G7 status: pairing again after untethered mode"
+                comment: "Watch G7 status: pairing again after watch mode"
             )
         }
         if phoneUsesG7Direct == false, sensorName == nil {
@@ -426,7 +430,7 @@ import WatchKit
             if soon < delay {
                 delay = soon
                 content.body = String(
-                    localized: "The watch hasn't read the sensor since untethered mode ended. Open Trio on the watch: it reconnects there."
+                    localized: "The watch hasn't read the sensor since watch mode ended. Open Trio on the watch: it reconnects there."
                 )
             }
         }
@@ -458,7 +462,7 @@ import WatchKit
         isStandingAside = aside
         noteAside(aside)
         if aside {
-            appendLog("Paused: untethered mode has the sensor")
+            appendLog("Paused: watch mode has the sensor")
             // untethered mode books its own "No Sensor Readings"
             bookNoReadingsAlert()
             session?.pause()
@@ -483,14 +487,14 @@ import WatchKit
                 setPeripheralIdentifier(handle)
                 appendLog(
                     !isEnabled
-                        ? "Untethered mode over: the watch sensor is switched off, not reading"
+                        ? "Watch mode over: the watch sensor is switched off, not reading"
                         : handle == nil
-                        ? "Untethered mode over: reading again, searching for the sensor"
-                        : "Untethered mode over: reading again, connecting to the sensor it used"
+                        ? "Watch mode over: reading again, searching for the sensor"
+                        : "Watch mode over: reading again, connecting to the sensor it used"
                 )
                 session?.update(credentials: credentials)
             } else {
-                appendLog(isEnabled ? "Untethered mode over: reading again" : "Untethered mode over: the watch sensor is switched off, not reading")
+                appendLog(isEnabled ? "Watch mode over: reading again" : "Watch mode over: the watch sensor is switched off, not reading")
             }
             isReconnecting = true
             // the reminder below counts from here until the first reading of our own
@@ -748,10 +752,17 @@ import WatchKit
     // MARK: - Persistence helpers
 
     private func setSharedKey(_ key: Data?) {
+        if key != sharedKey { setSensorAnswered(false) }
         sharedKey = key
         hasWatchKey = key != nil
         defaults.set(key, forKey: Key.sharedKey)
         if let key { WatchG7SlotKey.record(key, peripheral: peripheralIdentifier) }
+    }
+
+    private func setSensorAnswered(_ answered: Bool) {
+        guard answered != sensorAnswered else { return }
+        sensorAnswered = answered
+        defaults.set(answered, forKey: Key.sensorAnswered)
     }
 
     private func setPeripheralIdentifier(_ identifier: UUID?) {
@@ -1022,6 +1033,7 @@ import WatchKit
             // any answer ends a pairing's wait
             self.pairingStartedAt = nil
             self.pairedAt = nil
+            if self.hasWatchKey { self.setSensorAnswered(true) }
             guard message.hasReliableGlucose, let glucose = message.glucose else {
                 // a value the sensor marks unreliable: shown greyed with a warning, never used
                 if let glucose = message.glucose {

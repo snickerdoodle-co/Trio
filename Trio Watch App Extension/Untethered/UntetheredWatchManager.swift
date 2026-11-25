@@ -1,5 +1,6 @@
 import Foundation
 import LoopKit
+import OmnipodKit
 import UserNotifications
 import WatchConnectivity
 import WatchKit
@@ -86,6 +87,15 @@ import WatchKit
     /// The newest reading the watch took from the sensor itself in watch mode (`cgmManager(_:hasNew:)`), for the
     /// sensor details' "Watch BG": in watch mode the sensor's readings come through G7SensorKit, not the watch's reader.
     var ownSessionReadingDate: Date?
+    /// When the sensor's link last came up: a background wake has about 10 s of Bluetooth from then; pod messages
+    /// after that count toward a watchOS limit that cuts all of Trio's links (sysdiagnose, 19 November).
+    @ObservationIgnored var sensorLinkUpAt: Date?
+    /// The pod read started at the sensor's link-up, for the loop of that reading (`prefetchPodData`).
+    @ObservationIgnored var podPrefetch: (task: Task<Date?, Never>, at: Date)?
+    /// When the session's pod connection last came up, for the watchOS count's clock (c225).
+    @ObservationIgnored var podConnectedAt: Date?
+    /// When an SMB was last left for the next reading after a long temp connection (c225): only once in a row.
+    @ObservationIgnored var smbLeftAt: Date?
     /// A treatment came in while a loop ran; its determination follows.
     @ObservationIgnored var isDeterminationPending = false
     /// A mode changed while a loop ran; its constrained determination and enactment follow.
@@ -180,8 +190,10 @@ import WatchKit
     @ObservationIgnored private var standingGrantRequestedAt: Date?
 
     var isActive: Bool { data.session.phase == .active || data.session.phase == .ending }
-    /// A loop runs: Bluetooth work whose CPU a WatchConnectivity wake would count.
-    var isBluetoothWakeUnderway: Bool { isLooping }
+    /// A loop runs, or a sensor wake began under 30 s ago: Bluetooth work whose CPU a WatchConnectivity wake would count.
+    var isBluetoothWakeUnderway: Bool {
+        isLooping || sensorLinkUpAt.map { Date().timeIntervalSince($0) < 30 } ?? false
+    }
 
     private init() {
         // every stored property is set before a method of self runs: Swift refuses `adoptSavedState()` first
@@ -458,13 +470,13 @@ import WatchKit
                 notify(
                     id: Self.notificationPrefix + "handbackRequest",
                     title: String(localized: "Pump Back on iPhone"),
-                    body: String(localized: "The iPhone has the pump again and loops. Start untethered mode again when you want.")
+                    body: String(localized: "The iPhone has the pump again and loops. Start watch mode again when you want.")
                 )
             } else {
                 notify(
                     id: Self.notificationPrefix + "phoneTookPod",
                     title: String(localized: "iPhone Took the Pump"),
-                    body: String(localized: "The iPhone ended untethered mode and doses again. Check that Trio on the iPhone loops.")
+                    body: String(localized: "The iPhone ended watch mode and doses again. Check that Trio on the iPhone loops.")
                 )
             }
 
@@ -1366,17 +1378,26 @@ import WatchKit
         )
     }
 
+    /// For the Watch Mode sheet's checklist: the watch has no pairing of its own with the iPhone's sensor yet.
+    static var sensorNotPaired: String? {
+        let reader = WatchG7Reader.shared
+        guard reader.sensorName != nil, reader.isEnabled, !reader.hasWatchKey else { return nil }
+        return String(
+            localized: "The watch isn't paired with this sensor yet. Open the sensor page in Trio on the watch near the sensor and wait for its first reading, then start."
+        )
+    }
+
     func requestStart() {
         guard WatchState.shared.untetheredMode, data.session.phase == .idle, !isBusy else { return }
         // a start by hand shows in the log: on 3 November at 18:04:55 one went out 6 s after Trio opened from the
         // new-pod notice, and nothing showed whether it was tapped
         Task { await WatchLogger.shared.log("⌚️ Untethered: Start Untethered tapped on the watch", force: true) }
-        if let reason = versionMismatch ?? Self.batteryTooLow {
+        if let reason = versionMismatch ?? Self.batteryTooLow ?? Self.sensorNotPaired {
             setError(reason)
             return
         }
         guard WCSession.default.isReachable else {
-            setError(String(localized: "The phone must be reachable to start untethered mode."))
+            setError(String(localized: "The phone must be reachable to start watch mode."))
             return
         }
         setError(nil)
@@ -1412,6 +1433,18 @@ import WatchKit
     }
 
     private static let startRequestTries = 4
+
+    /// No start while the watch has no pairing of its own with the iPhone's sensor, or the sensor never answered it:
+    /// it would hold the pod with nothing to loop on (Jeremy Barnum's Loop, 22 November, "No Start until the watch
+    /// has read the sensor itself": 70 minutes on 17 November). The same check as the iPhone's readiness line.
+    static var sensorNotPaired: String? {
+        let reader = WatchG7Reader.shared
+        guard reader.sensorName != nil else { return nil }
+        if reader.hasWatchKey, reader.sensorAnswered || !reader.isEnabled { return nil }
+        return String(
+            localized: "The watch isn't paired with this sensor yet. Open the sensor page in Trio on the watch near the sensor and wait for its first reading, then start."
+        )
+    }
 
     // MARK: - Handing back
 
@@ -1593,7 +1626,7 @@ import WatchKit
         notify(
             id: Self.notificationPrefix + "phoneTookPod",
             title: String(localized: "iPhone Has the Pump"),
-            body: String(localized: "The iPhone has used the pod, so the watch stopped untethered mode. The iPhone loops again.")
+            body: String(localized: "The iPhone has used the pod, so the watch stopped watch mode. The iPhone loops again.")
         )
         apply(.emergencyStop(nil))
         return true
@@ -2336,6 +2369,30 @@ extension UntetheredWatchManager {
         )
     }
 
+    // MARK: - Ready for a forgotten iPhone
+
+    static let readinessGrantKey = "grantIssuedAt"
+    static let metPodCounterKey = "untethered.metPodCounter"
+
+    /// What a start without the iPhone needs, sent with the battery report for the iPhone's "ready for a forgotten
+    /// iPhone" line (22 November: a start without the iPhone fails when the watch never met the pod or the sensor,
+    /// and nothing says so until the iPhone is left behind). The time of the copy tells the iPhone which pod it was.
+    var readinessReport: [String: Any] {
+        let reader = WatchG7Reader.shared
+        var report: [String: Any] = [
+            "readerOn": reader.isEnabled,
+            "sensorName": reader.sensorName ?? "",
+            "sensorReady": reader.hasWatchKey && reader.sensorAnswered
+        ]
+        if let issuedAt = data.standingGrantIssuedAt, data.standingGrant != nil {
+            report[Self.readinessGrantKey] = issuedAt.timeIntervalSince1970
+            report["podKnown"] = !standingGrantPodUnknown
+        }
+        // names its pod: the iPhone ignores it for any other
+        if let counter = UserDefaults.standard.string(forKey: Self.metPodCounterKey) { report["podCounter"] = counter }
+        return report
+    }
+
     // MARK: - Meeting a new pod
 
     /// The pod of the standing grant has no handle on this watch. Finding it takes a search, which watchOS runs only
@@ -2421,8 +2478,16 @@ extension UntetheredWatchManager {
             }
             self.store.update { $0.localStates[pump.pluginIdentifier] = local }
             UserDefaults.standard.set(false, forKey: Self.grantPodUnknownKey)
+            // the meeting logged in to the pod: the iPhone takes the counter it left as the watch's, not another
+            // controller's (22 November: a start right after the meeting failed on it)
+            let counter = (pump as? OmniPumpManager)?.sessionCounterForPartner
+            UserDefaults.standard.set(counter, forKey: Self.metPodCounterKey)
             self.refresh()
-            await WatchLogger.shared.log("⌚️ Untethered: found the new pod in \(seconds) s; the fallback can reach it now", force: true)
+            WatchState.shared.reportBatteryIfChanged()
+            await WatchLogger.shared.log(
+                "⌚️ Untethered: found the new pod in \(seconds) s; the fallback can reach it now\(counter == nil ? "" : ", its session counter sent to the iPhone")",
+                force: true
+            )
         }
     }
 

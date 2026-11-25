@@ -259,11 +259,11 @@ struct EditOverrideForm: View {
             .listRowBackground(Color.chart)
 
             Section {
-                Toggle("Show Untethered Watch Button", isOn: $showUntetheredButton)
+                Toggle("Show Watch Mode Button", isOn: $showUntetheredButton)
                     .onChange(of: showUntetheredButton) { hasChanges = true }
             } footer: {
                 Text(
-                    "While this override runs, a watch button next to its cancel button hands the loop to the Apple Watch. Untethered mode ends with the override."
+                    "While this override runs, a watch button next to its cancel button hands the loop to the Apple Watch. Watch mode ends with the override."
                 )
             }
             .listRowBackground(Color.chart)
@@ -296,14 +296,11 @@ struct EditOverrideForm: View {
                     HStack {
                         Text("From")
                         Spacer()
-                        Text(
-                            state.is24HourFormat() ? state.format24Hour(Int(truncating: start! as NSNumber)) + ":00" :
-                                state.convertTo12HourFormat(Int(truncating: start! as NSNumber))
-                        )
-                        .foregroundColor(!displayPickerDisableSmbSchedule ? .primary : .accentColor)
-                        .onTapGesture {
-                            displayPickerDisableSmbSchedule = toggleScrollWheel(displayPickerDisableSmbSchedule)
-                        }
+                        Text(Date(hourOfDay: Int(truncating: start! as NSNumber)), format: .timeOfDay)
+                            .foregroundColor(!displayPickerDisableSmbSchedule ? .primary : .accentColor)
+                            .onTapGesture {
+                                displayPickerDisableSmbSchedule = toggleScrollWheel(displayPickerDisableSmbSchedule)
+                            }
 
                         Spacer()
 
@@ -313,14 +310,11 @@ struct EditOverrideForm: View {
 
                         Text("To")
                         Spacer()
-                        Text(
-                            state.is24HourFormat() ? state.format24Hour(Int(truncating: end! as NSNumber)) + ":00" :
-                                state.convertTo12HourFormat(Int(truncating: end! as NSNumber))
-                        )
-                        .foregroundColor(!displayPickerDisableSmbSchedule ? .primary : .accentColor)
-                        .onTapGesture {
-                            displayPickerDisableSmbSchedule = toggleScrollWheel(displayPickerDisableSmbSchedule)
-                        }
+                        Text(Date(hourOfDay: Int(truncating: end! as NSNumber)), format: .timeOfDay)
+                            .foregroundColor(!displayPickerDisableSmbSchedule ? .primary : .accentColor)
+                            .onTapGesture {
+                                displayPickerDisableSmbSchedule = toggleScrollWheel(displayPickerDisableSmbSchedule)
+                            }
                     }
 
                     if displayPickerDisableSmbSchedule {
@@ -332,14 +326,8 @@ struct EditOverrideForm: View {
                                     hasChanges = true
                                 }
                             ), label: Text("")) {
-                                if state.is24HourFormat() {
-                                    ForEach(0 ..< 24, id: \.self) { hour in
-                                        Text(state.format24Hour(hour) + ":00").tag(hour)
-                                    }
-                                } else {
-                                    ForEach(0 ..< 24, id: \.self) { hour in
-                                        Text(state.convertTo12HourFormat(hour)).tag(hour)
-                                    }
+                                ForEach(0 ..< 24, id: \.self) { hour in
+                                    Text(Date(hourOfDay: hour), format: .timeOfDay).tag(hour)
                                 }
                             }
                             .pickerStyle(WheelPickerStyle())
@@ -352,14 +340,8 @@ struct EditOverrideForm: View {
                                     hasChanges = true
                                 }
                             ), label: Text("")) {
-                                if state.is24HourFormat() {
-                                    ForEach(0 ..< 24, id: \.self) { hour in
-                                        Text(state.format24Hour(hour) + ":00").tag(hour)
-                                    }
-                                } else {
-                                    ForEach(0 ..< 24, id: \.self) { hour in
-                                        Text(state.convertTo12HourFormat(hour)).tag(hour)
-                                    }
+                                ForEach(0 ..< 24, id: \.self) { hour in
+                                    Text(Date(hourOfDay: hour), format: .timeOfDay).tag(hour)
                                 }
                             }
                             .pickerStyle(WheelPickerStyle())

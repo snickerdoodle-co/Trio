@@ -155,6 +155,12 @@ extension Home.RootView {
                 state.shouldDisplayPumpSetupSheet.toggle()
             }
         }
+        // watch mode: hand the pump to the watch, or take it back (25 November)
+        .onLongPressGesture {
+            guard state.pumpDisplayState != nil else { return }
+            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+            showWatchModeSheet = true
+        }
         // group reservoir/battery/pod into one button so VO reads it as a single control
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)

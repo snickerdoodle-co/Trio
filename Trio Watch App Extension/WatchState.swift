@@ -1171,8 +1171,8 @@ import WatchKit
 // MARK: - Watch battery for the phone
 
 extension WatchState {
-    /// The last battery level sent to the phone.
-    private static var lastBatteryReport: (percent: Int, charging: Bool, at: Date)?
+    /// The last battery level sent to the phone, with what the watch said about a start without the iPhone.
+    private static var lastBatteryReport: (percent: Int, charging: Bool, readiness: NSDictionary, at: Date)?
 
     /// Sends the watch's battery to the phone when it changed or every 30 minutes; the phone puts it in the
     /// device status it uploads, and LoopFollow shows it next to the phone's (asked for by the first tester).
@@ -1184,14 +1184,19 @@ extension WatchState {
         guard level >= 0 else { return }
         let percent = Int((level * 100).rounded())
         let charging = device.batteryState == .charging || device.batteryState == .full
+        let readiness = UntetheredWatchManager.shared.readinessReport
+        // the copy's time changes with every copy: not a change worth sending for
+        var compared = readiness
+        compared.removeValue(forKey: UntetheredWatchManager.readinessGrantKey)
+        let comparable = NSDictionary(dictionary: compared)
         if let last = Self.lastBatteryReport, last.percent == percent, last.charging == charging,
-           now.timeIntervalSince(last.at) < 30 * 60
+           last.readiness.isEqual(comparable), now.timeIntervalSince(last.at) < 30 * 60
         {
             return
         }
         let session = WCSession.default
         guard WCSession.isSupported(), session.activationState == .activated else { return }
-        Self.lastBatteryReport = (percent, charging, now)
+        Self.lastBatteryReport = (percent, charging, comparable, now)
         let date = now.timeIntervalSince1970
         // off the main thread: the transfer list's read hung it for 20 minutes (`WCTransfers`)
         WCTransfers.run {
@@ -1204,7 +1209,8 @@ extension WatchState {
                     "percent": percent,
                     "charging": charging,
                     "date": date
-                ]
+                ],
+                WatchMessageKeys.watchReadiness: readiness
             ])
         }
     }

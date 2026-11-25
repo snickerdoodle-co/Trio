@@ -109,6 +109,8 @@ enum WatchMessageKeys {
     static let pumpBatteryPercent = "pumpBatteryPercent"
     /// The watch's own battery (percent, charging, date), for the phone's device status upload.
     static let watchBattery = "watchBattery"
+    /// With the battery: what a start without the iPhone needs, as the watch sees it (`readinessReport`).
+    static let watchReadiness = "watchReadiness"
     static let pumpExpiresAt = "pumpExpiresAt"
     static let pumpActivatedAt = "pumpActivatedAt"
     static let pumpStatusMessage = "pumpStatusMessage"

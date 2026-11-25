@@ -96,14 +96,6 @@ extension Home.RootView {
             }
         }
 
-        let smbScheduleString = latestOverride
-            .smbIsScheduledOff && ((latestOverride.start?.stringValue ?? "") != (latestOverride.end?.stringValue ?? ""))
-            ? " \(formatTimeRange(start: latestOverride.start?.stringValue, end: latestOverride.end?.stringValue))"
-            : ""
-
-        let smbToggleString = latestOverride.smbIsOff || latestOverride
-            .smbIsScheduledOff ? String(localized: "SMBs Off\(smbScheduleString)") : ""
-
         var smbMinuteLabel = (text: "", spoken: "")
         var uamMinuteLabel = (text: "", spoken: "")
 
@@ -129,7 +121,7 @@ extension Home.RootView {
             }
         }
 
-        let otherComponents = [percentString, targetString, smbToggleString]
+        let otherComponents = [percentString, targetString, latestOverride.smbOffText]
         let components = ([durationLabel.text] + otherComponents + [smbMinuteLabel.text, uamMinuteLabel.text])
             .filter { !$0.isEmpty }
         let spokenComponents = ([durationLabel.spoken] + otherComponents + [smbMinuteLabel.spoken, uamMinuteLabel.spoken])
@@ -804,13 +796,13 @@ extension Home.RootView {
         case let .untetheredAudit(finding):
             panelBanner(
                 systemImage: "applewatch.slash",
-                title: String(localized: "Insulin Check After Untethered Mode"),
+                title: String(localized: "Insulin Check After Watch Mode"),
                 subtitle: String(localized: "Pump and records differ. Tap for details."),
                 tint: .orange
             ) {
                 showUntetheredAuditFinding = true
             }
-            .alert(String(localized: "Insulin Check After Untethered Mode"), isPresented: $showUntetheredAuditFinding) {
+            .alert(String(localized: "Insulin Check After Watch Mode"), isPresented: $showUntetheredAuditFinding) {
                 Button(String(localized: "OK"), role: .cancel) {
                     resolver.resolve(UntetheredPhoneManager.self)?.acknowledgeAuditFinding()
                 }

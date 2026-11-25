@@ -95,7 +95,7 @@ struct ChartSelectionRow: View {
     }
 
     private var timeString: String {
-        (selectedGlucose?.date ?? unsure?.date)?.formatted(.dateTime.hour().minute(.twoDigits)) ?? ""
+        (selectedGlucose?.date ?? unsure?.date)?.formatted(.timeOfDay) ?? ""
     }
 
     /// Stand-in for a value the selection resolves to nothing: the item keeps its place and

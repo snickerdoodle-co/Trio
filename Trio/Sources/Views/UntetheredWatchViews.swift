@@ -1,5 +1,6 @@
 import Charts
 import SwiftUI
+import WatchConnectivity
 
 extension UntetheredPhoneManager {
     /// Checking the devices, handing over, handing back or reading the pump after its return.
@@ -101,15 +102,53 @@ struct UntetheredSettingsSection: View {
 
             if manager.isWatchInCharge {
                 Button("Take Back the Pump Now", role: .destructive) { confirmForce = true }
+            } else {
+                TimelineView(.periodic(from: .now, by: 30)) { _ in
+                    UntetheredReadinessRow(readiness: manager.readiness)
+                }
             }
         }
         .listRowBackground(Color.chart)
-        .confirmationDialog("End untethered mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
+        .confirmationDialog("End watch mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
             Button("End") { Task { await manager.end() } }
         } message: {
             Text("The watch hands the pump back as soon as it is reachable.")
         }
         .untetheredForceDialog(isPresented: $confirmForce, manager: manager)
+    }
+}
+
+/// Whether the watch could start by itself if the iPhone were left behind now.
+struct UntetheredReadinessRow: View {
+    let readiness: UntetheredPhoneManager.Readiness
+
+    var body: some View {
+        switch readiness {
+        case .off:
+            EmptyView()
+        case .ready:
+            Label("Ready for a forgotten iPhone", systemImage: "checkmark.circle.fill")
+                .font(.footnote)
+                .foregroundStyle(Color.loopGreen)
+        case let .unknown(hours):
+            Label(unknownText(hours), systemImage: "questionmark.circle")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        case let .missing(missing):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Not ready for a forgotten iPhone", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                ForEach(missing, id: \.self) { Text(verbatim: "• " + $0) }
+            }
+            .font(.footnote)
+        }
+    }
+
+    private func unknownText(_ hours: Int?) -> String {
+        guard let hours else {
+            return String(localized: "Ready for a forgotten iPhone? No word from the watch yet: open Trio on it.")
+        }
+        return String(localized: "Ready for a forgotten iPhone? No word from the watch for \(hours) h.")
     }
 }
 
@@ -140,7 +179,7 @@ struct UntetheredOverrideButton: View {
             }
         }
         .frame(minWidth: 30)
-        .confirmationDialog("End untethered mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
+        .confirmationDialog("End watch mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
             Button("End") { Task { await manager.end() } }
             Button("Take Back the Pump Now", role: .destructive) { confirmForce = true }
         }
@@ -149,7 +188,7 @@ struct UntetheredOverrideButton: View {
         .onChange(of: manager.state.lastError) { _, error in
             showError = error != nil && !manager.isWatchInCharge
         }
-        .alert("Untethered Watch Mode", isPresented: $showError) {
+        .alert("Watch Mode", isPresented: $showError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(manager.state.lastError ?? "")
@@ -171,16 +210,18 @@ struct UntetheredBannerSlot<Content: View, Banner: View>: View {
     var body: some View {
         if manager.isWatchInCharge || manager.state.pumpReturnPending {
             // by the second while the start reaches the watch, so its progress counts up
-            TimelineView(.periodic(from: .now, by: manager.isReachingWatch ? 1 : 60)) { context in
+            TimelineView(.periodic(from: .now, by: manager.isReachingWatch ? 1 : 30)) { context in
+            let silentMinutes = manager.watchSilentMinutes(now: context.date)
             banner(
                 manager.isBluetoothOff
                     ? String(localized: "⚠️ iPhone Bluetooth Off")
                     : manager.state.pumpReturnPending
                     ? manager.pumpReturnTitle
-                    : manager.isReachingWatch ? String(localized: "Starting Untethered…")
+                    : manager.isReachingWatch ? String(localized: "Starting Watch Mode…")
                     : manager.isHandingBack ? String(localized: "Asking the watch for the pump…")
                     : manager.state.session.isCheckingForeignSession ? String(localized: "Safety Check with the Watch")
-                    : String(localized: "Untethered on Apple Watch"),
+                    : silentMinutes != nil ? String(localized: "⚠️ No Word From the Watch")
+                    : String(localized: "Watch mode on Apple Watch"),
                 manager.isBluetoothOff
                     ? (manager.state.pumpReturnPending
                         ? String(localized: "The phone can't reach the pump and nothing doses. Turn Bluetooth on.")
@@ -194,14 +235,19 @@ struct UntetheredBannerSlot<Content: View, Banner: View>: View {
                     ? manager.handingBackText
                     : manager.state.session.isCheckingForeignSession
                     // not untethered mode, though it shows in its place (6 November, 07:36: "what was that?")
-                    ? String(localized: "The watch was just at the pod. The phone waits for the watch's answer before dosing again, usually a few seconds. Untethered mode is not on.")
-                    : String(localized: "The phone doesn't dose. Bolus and carbs are entered on the watch."),
+                    ? String(localized: "The watch was just at the pod. The phone waits for the watch's answer before dosing again, usually a few seconds. Watch mode is not on.")
+                    : silentMinutes.map {
+                        String(
+                            localized: "Nothing from the watch for \($0) min, though both are near the sensor. Open Trio on the watch and check that it loops, or tap here to take the pump back."
+                        )
+                    }
+                    ?? String(localized: "The phone doesn't dose. Bolus and carbs are entered on the watch."),
                 manager.isWatchInCharge && !manager.isReachingWatch,
                 { showActions = manager.isWatchInCharge && !manager.isReachingWatch }
             )
             }
-            .confirmationDialog("Untethered Watch Mode", isPresented: $showActions, titleVisibility: .visible) {
-                Button("End Untethered Mode") { Task { await manager.end() } }
+            .confirmationDialog("Watch Mode", isPresented: $showActions, titleVisibility: .visible) {
+                Button("End Watch Mode") { Task { await manager.end() } }
                 Button("Take Back the Pump Now", role: .destructive) { confirmForce = true }
             }
             .untetheredForceDialog(isPresented: $confirmForce, manager: manager)
@@ -336,7 +382,7 @@ struct UntetheredTreatmentGate<Content: View>: View {
                             : String(localized: "The phone doses again once it has read the pump.")
                             : manager.state.session.isCheckingForeignSession
                             ? String(
-                                localized: "The watch was just at the pod. Boluses wait for the watch's answer, usually a few seconds. Untethered mode is not on."
+                                localized: "The watch was just at the pod. Boluses wait for the watch's answer, usually a few seconds. Watch mode is not on."
                             )
                             :
                             String(
@@ -365,7 +411,7 @@ struct UntetheredTreatmentGate<Content: View>: View {
                     }
                 } else if manager.isWatchShownInCharge {
                     VStack(spacing: 10) {
-                        gateButton("End Untethered Mode", systemImage: "iphone", tint: .untethered) { confirmEnd = true }
+                        gateButton("End Watch Mode", systemImage: "iphone", tint: .untethered) { confirmEnd = true }
                         gateButton("Take Back the Pump Now", systemImage: "exclamationmark.triangle", tint: .red) {
                             confirmForce = true
                         }
@@ -382,7 +428,7 @@ struct UntetheredTreatmentGate<Content: View>: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
             }
-            .confirmationDialog("End untethered mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
+            .confirmationDialog("End watch mode?", isPresented: $confirmEnd, titleVisibility: .visible) {
                 Button("End") { Task { await manager.end() } }
             } message: {
                 Text("The watch hands the pump back as soon as it is reachable.")
@@ -448,6 +494,136 @@ private extension View {
             Text(
                 "Use this when the watch can't hand the pump back, for example when it is lost or out of battery. The phone first reaches for the pod; if it can't, nothing changes and the watch keeps running. Otherwise it takes the pump without waiting for the watch, and counts insulin it has no record of until the watch's history arrives."
             )
+        }
+    }
+}
+
+/// Watch mode from the Home screen: a long press on the pump panel opens it (25 November: the start was deep in
+/// Settings). What the watch still needs, then the start; while the watch has the pump, the way back. The watch's own
+/// start (a long press on its glucose bubble, then the crown) is the main one.
+struct UntetheredStartSheet: View {
+    @ObservedObject var manager: UntetheredPhoneManager
+    @Binding var isPresented: Bool
+    @State private var confirmStart = false
+    @State private var confirmEnd = false
+    @State private var refusal: String?
+
+    private var watchReachable: Bool {
+        WCSession.isSupported() && WCSession.default.activationState == .activated && WCSession.default.isReachable
+    }
+
+    var body: some View {
+        NavigationStack {
+            // WatchConnectivity's reachability isn't observable, and it flips as the watch's screen sleeps and wakes:
+            // read again every second (25 November: 'open Trio on the watch' while it was open, until the sheet was
+            // opened again)
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+            List {
+                if !manager.isEnabled {
+                    Section {
+                        Text("Watch mode is off. Turn it on in Settings › Apple Watch.")
+                    }
+                } else if manager.isWatchInCharge {
+                    Section {
+                        Label(
+                            manager.isHandingBack ? "The watch is handing back…" : "The watch has the pump and loops on its own.",
+                            systemImage: "applewatch"
+                        )
+                    }
+                    Section {
+                        Button("Take the Pump Back") { confirmEnd = true }
+                            .disabled(manager.isHandingBack)
+                    } footer: {
+                        Text("The watch hands back at its next wake, at most about 5 minutes.")
+                    }
+                } else {
+                    Section {
+                        line(
+                            ok: watchReachable,
+                            "Apple Watch",
+                            watchReachable ? "Trio is open on the watch." :
+                                "Open Trio on the watch and keep its screen on: the iPhone can't wake it."
+                        )
+                        if let problem = manager.watchSensorNotPaired {
+                            line(ok: false, "Sensor", problem)
+                        } else {
+                            line(ok: true, "Sensor", "The watch reads it.")
+                        }
+                        if let knows = manager.watchKnowsPod {
+                            line(
+                                ok: knows ? true : nil,
+                                "Pod",
+                                knows ? "The watch knows it." : "The watch finds the new pod at the start."
+                            )
+                        }
+                    } header: {
+                        Text("Before the Start")
+                    }
+                    Section {
+                        Button {
+                            refusal = nil
+                            confirmStart = true
+                        } label: {
+                            Label("Start Watch Mode", systemImage: "applewatch")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .tint(Color.untethered)
+                        .disabled(!watchReachable || manager.watchSensorNotPaired != nil || manager.isBusy)
+                        if manager.isBusy {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                Text("Handing the pump to the watch…")
+                            }
+                        }
+                        if let refusal {
+                            Text(refusal).foregroundStyle(.orange)
+                        }
+                    } footer: {
+                        Text("You can also start on the watch: long-press its glucose bubble, then turn the crown.")
+                    }
+                }
+            }
+            }
+            .navigationTitle("Watch Mode")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { isPresented = false }
+                }
+            }
+            .confirmationDialog(
+                "Hand the pump and the sensor to the watch?",
+                isPresented: $confirmStart,
+                titleVisibility: .visible
+            ) {
+                Button("Start Watch Mode") {
+                    Task { refusal = await manager.start() }
+                }
+            }
+            .confirmationDialog(
+                "Take the pump back from the watch?",
+                isPresented: $confirmEnd,
+                titleVisibility: .visible
+            ) {
+                Button("Take the Pump Back") {
+                    Task { await manager.end() }
+                }
+            }
+            .onChange(of: manager.state.session.phase) { _, phase in
+                if phase == .active { isPresented = false }
+            }
+        }
+    }
+
+    /// ok: green tick, orange warning, or (nil) a neutral note.
+    private func line(ok: Bool?, _ title: LocalizedStringKey, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: ok == true ? "checkmark.circle.fill" : ok == false ? "exclamationmark.triangle.fill" : "info.circle")
+                .foregroundStyle(ok == true ? Color.green : ok == false ? Color.orange : Color.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.subheadline).bold()
+                Text(LocalizedStringKey(detail)).font(.footnote).foregroundStyle(.secondary)
+            }
         }
     }
 }

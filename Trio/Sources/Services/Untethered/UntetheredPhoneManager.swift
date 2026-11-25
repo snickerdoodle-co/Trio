@@ -1,6 +1,7 @@
 import Combine
 import CoreData
 import Foundation
+import G7SensorKit
 import HealthKit
 import LoopKit
 import OmnipodKit
@@ -280,6 +281,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                     await self?.checkForeignSession()
                     await self?.tickWhileWaiting()
                     await self?.checkWatchSilence()
+                    self?.checkReadiness()
                 }
             }
             .store(in: &subscriptions)
@@ -359,6 +361,135 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     var isWatchInCharge: Bool { !state.session.isIdle }
 
+    // MARK: - Ready for a forgotten iPhone
+
+    enum Readiness: Equatable {
+        /// The watch doesn't start by itself (Settings › Apple Watch).
+        case off
+        /// Nothing from the watch for this many hours (nil: never).
+        case unknown(hours: Int?)
+        case ready
+        case missing([String])
+    }
+
+    /// Whether the watch could start without the iPhone if it were left behind now (22 November: the watch has to
+    /// have met the pod and the sensor once with Trio open, and nothing said so until the iPhone was gone).
+    var readiness: Readiness {
+        let settings = settingsManager.settings
+        guard settings.fallbackLoopWatch, Self.allowsStartWithoutPhone(settings) else { return .off }
+        guard let report = WatchReadiness.latest else { return .unknown(hours: nil) }
+        let age = Date().timeIntervalSince(report.at)
+        if age > Self.readinessMaxAge { return .unknown(hours: Int(age / 3600)) }
+        var missing: [String] = []
+        // the copy the watch answered for must be of this pod: older, it was of the pod before
+        let pod = (apsManager.pumpManager as? OmniPumpManager)?.state.podState?.activatedAt
+        if !report.podKnown || (pod.map { (report.grantIssuedAt ?? .distantPast) < $0 } ?? false) {
+            missing.append(String(localized: "the watch hasn't met this pod yet: open Trio on the watch near the pod"))
+        }
+        let g7 = fetchGlucoseManager.cgmManager as? G7CGMManager
+        if g7?.state.sessionMode != .direct || g7?.state.sensorID == nil {
+            missing.append(String(localized: "the iPhone doesn't read a G7 directly, so the watch has no sensor to read"))
+        } else if !report.readerOn {
+            missing.append(String(localized: "the watch's G7 reader is off: turn it on on the sensor page of Trio on the watch"))
+        } else if !report.sensorReady || report.sensorName.suffix(2) != (g7?.state.sensorID ?? "").suffix(2) {
+            missing.append(
+                String(localized: "the watch isn't paired with this sensor yet: open Trio on the watch near the sensor until the first reading")
+            )
+        }
+        return missing.isEmpty ? .ready : .missing(missing)
+    }
+
+    /// While the watch hasn't met the current pod (its last report is of an older pod's copy), the iPhone doesn't hold
+    /// the pod's link open between commands, not even with Trio in front: a connected pod doesn't advertise, so the
+    /// watch's look can't find it. 24 November, second tester: after a pod change the iPhone held the new pod for
+    /// 6.5 min and the watch looked three times for 41 s without finding it; at Start the iPhone let go and the watch
+    /// found it at once. Called when the watch reports and when a copy goes out; a watch that never reported changes
+    /// nothing.
+    func letWatchMeetPodIfNeeded() {
+        // a report from while the watch had the pump names no standing grant, so it says nothing about the pod
+        // (25 November, 16:10: "hasn't met this pod yet" for 2 min after a 5-hour session)
+        guard let pump = apsManager.pumpManager as? OmniPumpManager, let activated = pump.state.podState?.activatedAt,
+              let report = WatchReadiness.latest, report.grantIssuedAt != nil
+        else { return }
+        let met = report.podKnown && (report.grantIssuedAt ?? .distantPast) >= activated
+        let letGo = isEnabled && settingsManager.settings.allowUntetheredStartWithoutPhoneWatch && !isWatchInCharge && !met
+        if letGo != lettingWatchMeetPod {
+            debug(.watch, letGo ? "Untethered: the watch hasn't met this pod yet — the iPhone leaves its link free" :
+                "Untethered: the watch knows this pod — the iPhone's link as usual")
+            lettingWatchMeetPod = letGo
+        }
+        pump.setLetsPartnerMeetPod(letGo)
+    }
+
+    private var lettingWatchMeetPod = false
+
+    /// The session counter the watch left on the pod when it met it: the iPhone takes a resync to it as the watch's,
+    /// not another controller's. Only while the iPhone has the pump, and only for its pod (OmnipodKit checks).
+    func acceptWatchPodCounter(_ counter: String) {
+        guard !isWatchInCharge, let pump = apsManager.pumpManager as? OmniPumpManager else { return }
+        pump.acceptPartnerSessionCounter(counter)
+    }
+
+    /// Whether the watch has met the current pod, by its last report; nil without a report or a pod.
+    var watchKnowsPod: Bool? {
+        guard let report = WatchReadiness.latest, report.grantIssuedAt != nil,
+              let activated = (apsManager.pumpManager as? OmniPumpManager)?.state.podState?.activatedAt
+        else { return nil }
+        return report.podKnown && (report.grantIssuedAt ?? .distantPast) >= activated
+    }
+
+    /// What the watch last said about the sensor, when it says the watch can't read it: no start then (as the watch
+    /// checks itself). Nothing from the watch yet, or nothing recent: no refusal, the watch's own check stands.
+    var watchSensorNotPaired: String? {
+        guard let report = WatchReadiness.latest, Date().timeIntervalSince(report.at) < Self.readinessMaxAge,
+              report.readerOn,
+              let g7 = fetchGlucoseManager.cgmManager as? G7CGMManager, g7.state.sessionMode == .direct,
+              let sensor = g7.state.sensorID
+        else { return nil }
+        guard !report.sensorReady || report.sensorName.suffix(2) != sensor.suffix(2) else { return nil }
+        return String(
+            localized: "The watch isn't paired with this sensor yet. Open the sensor page in Trio on the watch near the sensor and wait for its first reading, then start."
+        )
+    }
+
+    /// A report older than this says nothing about now.
+    private static let readinessMaxAge: TimeInterval = 6 * 60 * 60
+    /// Time for the watch to get the new pod's copy and answer, and for the user to open Trio on it.
+    private static let readinessNoticeAfter: TimeInterval = 15 * 60
+    private static let readinessNoticeEvery: TimeInterval = 2 * 60 * 60
+    private static let readinessNoticeKey = "untethered.readinessNoticeAt"
+    static let readinessNoticeID = "untethered.watchNotReady"
+    private var readinessMissingSince: Date?
+
+    /// At each reading while the phone has the pump: after 15 minutes not ready, said every 2 hours, 8:00 to 22:00.
+    @MainActor private func checkReadiness() {
+        guard !isWatchInCharge, case let .missing(missing) = readiness else {
+            readinessMissingSince = nil
+            if readiness == .ready {
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.readinessNoticeID])
+            }
+            return
+        }
+        let now = Date()
+        if readinessMissingSince == nil { readinessMissingSince = now }
+        let hour = Calendar.current.component(.hour, from: now)
+        let last = UserDefaults.standard.object(forKey: Self.readinessNoticeKey) as? Date ?? .distantPast
+        guard now.timeIntervalSince(readinessMissingSince ?? now) >= Self.readinessNoticeAfter, (8 ..< 22).contains(hour),
+              now.timeIntervalSince(last) >= Self.readinessNoticeEvery
+        else { return }
+        UserDefaults.standard.set(now, forKey: Self.readinessNoticeKey)
+        let text = missing.joined(separator: "; ")
+        warning(.watch, "Untethered: the watch isn't ready for a forgotten iPhone: \(text)")
+        let content = UNMutableNotificationContent()
+        content.title = String(localized: "Watch Not Ready Without iPhone")
+        content.body = String(localized: "If you leave the iPhone behind, the watch can't take over: \(text).")
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: Self.readinessNoticeID, content: content, trigger: nil),
+            withCompletionHandler: nil
+        )
+    }
+
     // MARK: - A silent watch near the phone
 
     /// Since when this phone app has seen the watch in charge; the silence counts from here at the earliest.
@@ -372,7 +503,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     private static let watchSilenceAfter: TimeInterval = 20 * 60
     /// The phone reads the sensor every 5 minutes: a silence reaching 20 minutes before the next reading is said at its
     /// 20th minute, booked ahead and taken back when the watch is heard from (`WatchAppPresence.heardFromWatch`).
-    private static let watchSilenceLookahead: TimeInterval = 5 * 60
+    /// A little over 5 minutes: a silence due a few seconds past the next reading is booked at this one (22 November,
+    /// 10:15: due in 5 min 3 s, not booked, and the next check came too late).
+    private static let watchSilenceLookahead: TimeInterval = 5.5 * 60
     static let watchSilentID = "untethered.watchSilent"
     /// The phone's own reading this recent: it is within Bluetooth range of the sensor, so near the user and the watch.
     private static let phoneNearWithin: TimeInterval = 6 * 60
@@ -388,6 +521,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             watchInChargeSince = nil
             watchSilenceNotifiedFor = nil
             watchSilenceAskedFor = nil
+            watchSilentNoticeDue = nil
             return
         }
         let now = Date()
@@ -408,7 +542,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         let settings = settingsManager.settings
         if settings.nightscoutUploadWatch, settings.isUploadEnabled,
            let newest = await nightscoutManager.fetchNewestDeviceStatusDate(),
-           now.timeIntervalSince(newest) < Self.watchSilenceAfter
+           // a loop from after the watch went quiet; one from before only says it looped then (22 November, 15:36:
+           // a loop 19 min old, from before the silence, held the notice back until the next reading)
+           newest > reference
         {
             debug(.watch, "Untethered: nothing from the watch for \(minutes) min, but Nightscout has a loop \(Int(now.timeIntervalSince(newest) / 60)) min old: it loops")
             return
@@ -416,6 +552,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         // still in charge, and still the same silence, after the wait for Nightscout
         guard isWatchInCharge, watchSilenceNotifiedFor != reference else { return }
         watchSilenceNotifiedFor = reference
+        watchSilentNoticeDue = now.addingTimeInterval(max(dueIn, 0))
         warning(
             .watch,
             "Untethered: nothing from the watch for \(Int(silence / 60)) min while the phone reads the sensor" +
@@ -437,6 +574,18 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             withCompletionHandler: nil
         )
     }
+    /// When the No Word From the Watch notice is due or was given: the home screen's banner says it too, as a
+    /// notification shows only for a few seconds and makes no sound with the iPhone on silent (22 November, 15:41).
+    @Published private(set) var watchSilentNoticeDue: Date?
+
+    /// Minutes without word from the watch, once the notice is due and nothing came from the watch since it was set.
+    func watchSilentMinutes(now: Date) -> Int? {
+        guard isWatchInCharge, let due = watchSilentNoticeDue, let reference = watchSilenceNotifiedFor, now >= due,
+              (WatchAppPresence.lastHeard ?? .distantPast) <= reference
+        else { return nil }
+        return Int(now.timeIntervalSince(reference) / 60)
+    }
+
     /// For what the screens show: not while the phone only asks the watch about the pod after another controller
     /// used it (`isCheckingForeignSession`); dosing is held then all the same.
     var isWatchShownInCharge: Bool { isWatchInCharge && !state.session.isCheckingForeignSession }
@@ -605,6 +754,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         ] {
             hasher.combine(part)
         }
+        // a new pod: the watch learns at once that it doesn't know it yet (the "ready for a forgotten iPhone" line)
+        hasher.combine((apsManager.pumpManager as? OmniPumpManager)?.state.podState?.activatedAt)
         let fingerprint = hasher.finalize()
         let now = Date()
         // a newer grant took over while this one was being made
@@ -624,6 +775,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         standingGrantFingerprint = fingerprint
         standingGrantSentAt = now
         debug(.watch, "Untethered: standing grant sent")
+        letWatchMeetPodIfNeeded()
     }
 
     /// The start reads the pump before it offers it: the toggle shows a spinner meanwhile.
@@ -686,6 +838,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         guard state.session.isIdle, !state.pumpReturnPending else {
             return String(localized: "The phone is still taking the pump back from the last session.")
         }
+        if let reason = watchSensorNotPaired { return reason }
         setError(nil)
         // about the last session; this one is judged on its own
         UntetheredGate.update {
@@ -776,7 +929,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         let content = UNMutableNotificationContent()
         content.title = String(localized: "Pump Back on iPhone")
         content.body = String(
-            localized: "The watch couldn't reach the pod for \(minutes) minutes, so the iPhone took the pump back. Start untethered mode again when you want."
+            localized: "The watch couldn't reach the pod for \(minutes) minutes, so the iPhone took the pump back. Start watch mode again when you want."
         )
         content.sound = .default
         UNUserNotificationCenter.current().add(
@@ -928,8 +1081,9 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
                 guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch,
                       attempt < Self.handbackRequestTries
                 else { break }
-                debug(.watch, "Untethered: the pod was busy, trying again in \(Int(Self.handbackRequestRetryDelay)) s (\(attempt) of \(Self.handbackRequestTries))")
-                self.setError(String(localized: "The pod is still busy with the watch. The phone tries again in a moment; keep it near the pod."))
+                // the take-back's own message says why (no pod link, or the pod busy with the watch); asleep, the
+                // phone tries again at its next wake (25 November: 16:00, 16:05, 16:10)
+                debug(.watch, "Untethered: take-back didn't get the pod, trying again in \(Int(Self.handbackRequestRetryDelay)) s (\(attempt) of \(Self.handbackRequestTries))")
                 try? await Task.sleep(nanoseconds: UInt64(Self.handbackRequestRetryDelay * 1_000_000_000))
                 guard self.state.session.phase == .active, envelope.epoch == self.state.session.epoch else { break }
             }
@@ -1399,7 +1553,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     @MainActor private func preflight() throws {
         guard isEnabled else {
-            throw UntetheredError.unavailable(String(localized: "Untethered mode is off in Settings › Apple Watch."))
+            throw UntetheredError.unavailable(String(localized: "Watch mode is off in Settings › Apple Watch."))
         }
         guard WCSession.isSupported(), WCSession.default.isPaired, WatchAppPresence.isInstalled(WCSession.default) else {
             throw UntetheredError.unavailable(String(localized: "Trio is not installed on a paired Apple Watch."))
@@ -1411,13 +1565,13 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         guard pump is ExclusiveDeviceControl, pump is PumpDeliveryOdometer else {
             throw UntetheredError.unavailable(
                 String(
-                    localized: "\(pump.localizedTitle) can't be handed to the watch. Untethered mode supports Omnipod DASH and Omnipod 5."
+                    localized: "\(pump.localizedTitle) can't be handed to the watch. Watch mode supports Omnipod DASH and Omnipod 5."
                 )
             )
         }
         guard let cgm = fetchGlucoseManager.cgmManager, cgm is DeviceConfigurationSharing else {
             throw UntetheredError.unavailable(
-                String(localized: "This CGM can't be read by the watch. Untethered mode supports Dexcom G7.")
+                String(localized: "This CGM can't be read by the watch. Watch mode supports Dexcom G7.")
             )
         }
         // the watch reads the same sensor; it links only around each reading, so its last contact proves nothing
@@ -2512,5 +2666,35 @@ extension UntetheredPhoneManager: SettingsObserver, PreferencesObserver, PumpSet
 extension UntetheredPhoneManager: BluetoothObserver {
     func bluetoothDidUpdateState(_: BluetoothState) {
         objectWillChange.send()
+    }
+}
+
+/// What the watch last said a start without the iPhone needs (its `readinessReport`), sent with its battery.
+struct WatchReadiness {
+    let at: Date
+    let grantIssuedAt: Date?
+    let podKnown: Bool
+    let readerOn: Bool
+    let sensorName: String
+    let sensorReady: Bool
+
+    private static let key = "untethered.watchReadiness"
+
+    static func store(_ payload: [String: Any]) {
+        var saved = payload
+        saved["at"] = Date().timeIntervalSince1970
+        UserDefaults.standard.set(saved, forKey: key)
+    }
+
+    static var latest: WatchReadiness? {
+        guard let saved = UserDefaults.standard.dictionary(forKey: key), let at = saved["at"] as? TimeInterval else { return nil }
+        return WatchReadiness(
+            at: Date(timeIntervalSince1970: at),
+            grantIssuedAt: (saved["grantIssuedAt"] as? TimeInterval).map(Date.init(timeIntervalSince1970:)),
+            podKnown: saved["podKnown"] as? Bool ?? false,
+            readerOn: saved["readerOn"] as? Bool ?? false,
+            sensorName: saved["sensorName"] as? String ?? "",
+            sensorReady: saved["sensorReady"] as? Bool ?? false
+        )
     }
 }

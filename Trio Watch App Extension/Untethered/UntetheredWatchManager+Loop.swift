@@ -92,9 +92,15 @@ extension UntetheredWatchManager {
             var explained = true
             var podReached = true
             if enacts, !self.loopHoldExpired {
-                let synced = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
-                    pump.ensureCurrentPumpData { continuation.resume(returning: $0) }
+                let synced: Date?
+                if let prefetch = self.podPrefetch, Date().timeIntervalSince(prefetch.at) < 60 {
+                    synced = await prefetch.task.value
+                } else {
+                    synced = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
+                        pump.ensureCurrentPumpData { continuation.resume(returning: $0) }
+                    }
                 }
+                self.podPrefetch = nil
                 // pod data older than the kit's own 6 minutes: the pod didn't answer this loop
                 podReached = synced.map { Date().timeIntervalSince($0) <= 6 * 60 } ?? false
                 // before the determination, so its IOB counts what the records miss
@@ -374,19 +380,41 @@ extension UntetheredWatchManager {
         // 2026-10-20 02:25 and 12:11): none starts once the loop has no background time left
         guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
         var sentTemp = false
+        var tempLinkAt: Date?
+        var tempDoneAt: Date?
         if let rate = determination.rate, determination.duration != nil, tempAlreadyRunning(rate.nearestDouble, pump: pump) {
             // not sent again; an SMB after it then goes in this wake
         } else if let rate = determination.rate, let duration = determination.duration {
+            tempLinkAt = Date()
+            await freshPodLink(pump, for: "temp basal")
+            guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
+            guard mayDose else { throw UntetheredWatchError.noPump }
             try await pump.enactTempBasal(
                 unitsPerHour: rate.nearestDouble,
                 for: TimeInterval(truncating: duration as NSNumber) * 60
             )
             sentTemp = true
+            tempDoneAt = Date()
         }
         // as the phone: no SMB on top of a bolus still running, e.g. the meal bolus just started
         if data.grant?.dosingMode == dosingMode, let units = determination.units, units > 0,
            pump.status.bolusState == .noBolus
         {
+            guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
+            guard mayDose else { throw UntetheredWatchError.noPump }
+            // the SMB in a connection of its own
+            if let ran = tempConnectionRanLong(linkAt: tempLinkAt, doneAt: tempDoneAt) {
+                smbLeftAt = Date()
+                Task {
+                    await WatchLogger.shared.log(
+                        String(format: "⌚️ Untethered: SMB %@ U left for the next reading: the temp's pod connection ran %.1f s", "\(units)", ran),
+                        force: true
+                    )
+                }
+                return true
+            }
+            smbLeftAt = nil
+            await freshPodLink(pump, for: "SMB")
             guard !loopHoldExpired else { throw UntetheredWatchError.noBackgroundTime }
             guard mayDose else { throw UntetheredWatchError.noPump }
             try await pump.enactBolus(units: units.nearestDouble, automatic: true)
@@ -396,13 +424,44 @@ extension UntetheredWatchManager {
         return true
     }
 
+    /// Jeremy Barnum's finding (24 November), checked against the first tester's night of 23–24 November (45
+    /// increases of the watchOS count that cuts all of Trio's links near 200): the clock runs from each pod connection,
+    /// not from the wake. Every increase came 4.5–8.4 s after a pod connection came up; connections whose last
+    /// message came by 3 s never counted (0 of 25), at 5 s most did (10 of 17); the idle hold after the last message
+    /// never counted. The pod read at the sensor's link-up opens a connection the loop's commands then reach late, so
+    /// in a background wake each command group gets a fresh connection: the link is dropped first, at the cost of a
+    /// new login (about 1.5 s). A cancel and a new temp take about 3.5 s, an SMB about 3 s. Not in Extended Mode.
+    private func freshPodLink(_ pump: PumpManager, for what: String) async {
+        guard WKApplication.shared().applicationState != .active, !isKeptAwake,
+              let omnipod = pump as? OmniPumpManager else { return }
+        omnipod.releaseLink()
+        // the disconnect goes through before the command dials again (a connect during a cancel can be lost)
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        Task { await WatchLogger.shared.log("⌚️ Untethered: fresh pod connection for the \(what)", force: true) }
+    }
+
+    /// c225 (sysdiagnose of 25 November, 14:00): once a pod connection has gone past about 5 s, the watch stays over
+    /// the watchOS limit until the app is suspended, and a fresh connection doesn't start the clock again: the SMB's
+    /// connection after a temp that ended 5 s into its connection added 16 to the count. Temps that ended by 4 s
+    /// (13:00, 14:35) added nothing, and their SMBs in a connection of their own nothing either. So after a temp
+    /// that ran past 4.5 s the SMB waits for the next reading, which works it out again; only once in a row.
+    /// How long the temp's connection had run when the temp was done; nil when it stayed under the limit.
+    private func tempConnectionRanLong(linkAt: Date?, doneAt: Date?) -> TimeInterval? {
+        guard let linkAt, let doneAt, let connected = podConnectedAt, connected >= linkAt, connected <= doneAt,
+              WKApplication.shared().applicationState != .active, !isKeptAwake,
+              smbLeftAt.map({ Date().timeIntervalSince($0) > 8 * 60 }) ?? true
+        else { return nil }
+        let ran = doneAt.timeIntervalSince(connected)
+        return ran > 4.5 ? ran : nil
+    }
+
     /// EJM0's idea (EJM0/Trio a418bdc): in a background wake, a temp at the rate already running with at least 15
     /// minutes left isn't sent again when it wouldn't end by about 9 s after the sensor's link-up. oref re-sets a
     /// running zero temp every 5 to 10 minutes as its planned length changes, and those late pod messages count
     /// toward the watchOS limit that cuts all of Trio's links near 200. The next wake can still extend it.
-    /// This branch doesn't note the sensor's link-up, so any background wake counts as late.
     private func tempAlreadyRunning(_ rate: Double, pump: PumpManager) -> Bool {
         guard WKApplication.shared().applicationState != .active, !isKeptAwake,
+              let linkUp = sensorLinkUpAt, Date().timeIntervalSince(linkUp) + 5 > 9,
               case let .tempBasal(dose) = pump.status.basalDeliveryState,
               dose.endDate.timeIntervalSinceNow >= 15 * 60, abs(dose.unitsPerHour - rate) < 0.001
         else { return false }
@@ -421,6 +480,25 @@ extension UntetheredWatchManager {
         _ = await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
             omnipod.readStatusIfOlder(than: 2 * 60) { continuation.resume(returning: $0) }
         }
+    }
+
+    /// Test (19 November): the pod read at the sensor's link-up instead of after the reading, about 1.5 s earlier in
+    /// the ~10 s of Bluetooth watchOS gives a background wake. The loop of that reading takes its result.
+    /// Only right after a reading of its own: after a gap the phone may have taken the pod meanwhile (second tester,
+    /// 21 November: back from 18 min out of reach, the watch logged in to the pod at the link-up, before the phone's
+    /// take-back reached it seconds later; the phone saw another controller on its pod and refused it).
+    func prefetchPodData() {
+        guard data.session.phase == .active, !data.podEnded, mayDose, !isLooping, let pump = pumpManager,
+              WKApplication.shared().applicationState != .active,
+              Date().timeIntervalSince(ownReadingAt ?? .distantPast) < Self.prefetchAfterReadingWithin,
+              podPrefetch.map({ Date().timeIntervalSince($0.at) > 60 }) ?? true else { return }
+        let task = Task { @MainActor in
+            await withCheckedContinuation { (continuation: CheckedContinuation<Date?, Never>) in
+                pump.ensureCurrentPumpData { continuation.resume(returning: $0) }
+            }
+        }
+        podPrefetch = (task, Date())
+        Task { await WatchLogger.shared.log("⌚️ Untethered: pod read at the sensor's link-up") }
     }
 
     /// The watch may still command the pod: the session runs (a hand-back until its last stage) and the phone isn't
@@ -1433,8 +1511,21 @@ extension UntetheredWatchManager: PumpManagerDelegate {
             Task { await WatchLogger.shared.log(look ? "⌚️ Device (look): \(message)" : "⌚️ Device: \(message)", force: look) }
         }
         DispatchQueue.main.async { self.noteSensorPairingEvent(message) }
+        // the sensor's link is up: the wake's 10 s of Bluetooth start now (G7SensorKit's G7WatchAcquisition says so
+        // only in its log, as the app's own G7 reader has its own copy)
+        if message.hasPrefix("[g7-watch] link up") {
+            let at = Date()
+            DispatchQueue.main.async {
+                self.sensorLinkUpAt = at
+                self.prefetchPodData()
+            }
+        }
         if message.hasPrefix("Pod connected"), isSessionPump(manager as AnyObject) {
-            DispatchQueue.main.async { self.loopAgainIfPodBack() }
+            let at = Date()
+            DispatchQueue.main.async {
+                self.podConnectedAt = at
+                self.loopAgainIfPodBack()
+            }
         }
         // ponytail: matched on OmnipodKit's disconnect line, as the sensor's link errors above; a link OmnipodKit
         // didn't end itself ("no reason recorded") and nothing from the pod either: watchOS ended it
@@ -2276,6 +2367,8 @@ extension UntetheredWatchManager: CGMManagerDelegate {
     }
 
     static let ownReadingAtKey = "untethered.ownReadingAt"
+    /// The pod read at the link-up only when the watch's last reading of its own is this recent: one missed reading at most.
+    static let prefetchAfterReadingWithin: TimeInterval = 11 * 60
     /// The newest reading the watch read from the sensor itself in this session, or the session's start.
     var ownReadingAt: Date? { UserDefaults.standard.object(forKey: Self.ownReadingAtKey) as? Date }
     /// No reading of its own for this long while looping on the phone's: the watch's sensor link is broken, and

@@ -183,9 +183,9 @@ struct UntetheredStatusView: View {
         case .active:
             if let lastLoop = data.lastLoopDate {
                 let minutes = max(0, Int(now.timeIntervalSince(lastLoop) / 60))
-                return ("applewatch", .untethered, "Untethered", "Last loop \(minutes) min ago")
+                return ("applewatch", .untethered, "Watch Mode", "Last loop \(minutes) min ago")
             }
-            return ("applewatch", .untethered, "Untethered", "Looping on the watch")
+            return ("applewatch", .untethered, "Watch Mode", "Looping on the watch")
         case .preparing,
              .starting:
             let waited = now.timeIntervalSince(manager.phaseSince)
@@ -366,23 +366,12 @@ struct UntetheredStatusView: View {
         } else {
             switch phase {
             case .idle:
-                Button { manager.requestStart() } label: {
-                    Label("Start Untethered", systemImage: "applewatch")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.untethered)
-                .disabled(!isPhoneReachable || manager.versionMismatch != nil)
+                // the start is on the first page now: a long press on the glucose bubble (25 November)
+                Label("Start: long-press the glucose bubble on the first page.", systemImage: "hand.tap")
+                    .font(.footnote)
+                    .foregroundStyle(Color.untethered)
                 if let mismatch = manager.versionMismatch {
                     note(Text(mismatch))
-                } else if !isPhoneReachable {
-                    note("Starts with the phone nearby and Trio open on it.")
-                    // without a copy the note below says why
-                    if WatchState.shared.allowUntetheredStartWithoutPhone, manager.startWithoutPhoneUnavailable == nil {
-                        Button { confirmStartWithoutPhone = true } label: {
-                            Label("Start Without Phone", systemImage: "iphone.slash")
-                        }
-                        .tint(.untethered)
-                    }
                 }
                 copyNote
             case .active where data.podEnded:
@@ -882,11 +871,10 @@ struct UntetheredGlanceView: View {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     VStack(spacing: 4) {
                         row(0, now: context.date)
-                        middle(now: context.date)
-                            .frame(maxHeight: .infinity)
+                        middle(now: context.date, height: middleHeight(screen: screen.size.height))
                         row(1, now: context.date)
                         if !isLuminanceReduced {
-                            Text("Tap for Trio", comment: "Hint at the bottom of Extended Untethered Mode's minimal screen")
+                            Text("Tap for Trio", comment: "Hint at the bottom of Extended Watch Mode's minimal screen")
                                 .font(.system(size: 10))
                                 .foregroundStyle(Self.dim)
                         }
@@ -911,6 +899,24 @@ struct UntetheredGlanceView: View {
 
     // MARK: - Layout
 
+    private static let rowHeight: CGFloat = 28
+    private static let hintHeight: CGFloat = 12
+    /// The large glucose with its time and delta, above the chart.
+    private static let glucoseHeaderHeight: CGFloat = 32
+
+    private func rowHeight(_ index: Int) -> CGFloat {
+        state.glanceLayout.row(index).allSatisfy { $0.item == nil } ? 0 : Self.rowHeight
+    }
+
+    /// Rows, header and hint kept small: the room goes to the chart (22 November).
+    /// The middle's height worked out from the screen's, not left to the layout: given only the room left, the chart
+    /// still came out as a thin strip (17 and 22 November, Extended Mode).
+    private func middleHeight(screen: CGFloat) -> CGFloat {
+        let hint = isLuminanceReduced ? 0 : Self.hintHeight
+        let gaps: CGFloat = isLuminanceReduced ? 2 : 3
+        return max(40, screen - rowHeight(0) - rowHeight(1) - hint - gaps * 4 - 2)
+    }
+
     /// Each element as wide as its slots.
     private func row(_ index: Int, now: Date) -> some View {
         let elements = state.glanceLayout.row(index)
@@ -926,22 +932,28 @@ struct UntetheredGlanceView: View {
                 }
             }
         }
-        .frame(height: elements.allSatisfy { $0.item == nil } ? 0 : 36)
+        .frame(height: rowHeight(index))
     }
 
-    @ViewBuilder private func middle(now: Date) -> some View {
+    @ViewBuilder private func middle(now: Date, height: CGFloat) -> some View {
         switch state.glanceLayout.slots[WatchGlanceLayout.center] {
         case .glucoseLarge:
             glucose(size: 58, now: now)
+                .frame(height: height)
         case .glucoseChart:
             VStack(spacing: 0) {
-                glucose(size: 30, now: now)
+                glucose(size: 24, now: now)
+                    .frame(height: Self.glucoseHeaderHeight)
                 chart
+                    .frame(height: max(30, height - Self.glucoseHeaderHeight))
             }
+            .frame(height: height)
         case .chart:
             chart
+                .frame(height: height)
         default:
             Color.clear
+                .frame(height: height)
         }
     }
 
@@ -951,7 +963,8 @@ struct UntetheredGlanceView: View {
             state: state,
             glucoseValues: state.glucoseValues,
             isScrubbing: .constant(false),
-            scrubSteps: .constant(0)
+            scrubSteps: .constant(0),
+            pointScale: 0.45
         )
             .allowsHitTesting(false)
     }
@@ -988,7 +1001,7 @@ struct UntetheredGlanceView: View {
                         Text(delta).foregroundStyle(Self.dim)
                     }
                 }
-                .font(.footnote.weight(.semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .monospacedDigit()
             }
         }
@@ -1000,7 +1013,7 @@ struct UntetheredGlanceView: View {
             ForEach(item.parts, id: \.self) { part in
                 VStack(spacing: 0) {
                     value(part, now: now)
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.system(size: 14, weight: .semibold))
                         .monospacedDigit()
                         .lineLimit(1)
                         .minimumScaleFactor(0.5)
@@ -1012,7 +1025,7 @@ struct UntetheredGlanceView: View {
                             Text(part.label.uppercased())
                         }
                     }
-                    .font(.system(size: 9, weight: .medium))
+                    .font(.system(size: 8, weight: .medium))
                     .kerning(0.6)
                     .foregroundStyle(Self.dim)
                     .lineLimit(1)
@@ -1032,7 +1045,7 @@ struct UntetheredGlanceView: View {
         case .loop:
             let age = data.lastLoopDate.map { now.timeIntervalSince($0) }
             HStack(spacing: 3) {
-                Circle().stroke(loopColor(age), lineWidth: 2.5).frame(width: 12, height: 12)
+                Circle().stroke(loopColor(age), lineWidth: 2).frame(width: 10, height: 10)
                 Text(age.map { "\(Int($0 / 60))m" } ?? "--")
             }
         case .iob:
@@ -1182,6 +1195,192 @@ struct ManualGlucoseEntryView: View {
 
 /// A risky action confirmed by a full turn of the Digital Crown instead of a tap: a deliberate motion that a
 /// brush against the small screen doesn't make. Turning back, Cancel or closing the sheet confirms nothing.
+/// Watch mode from the first page: a long press on the glucose bubble opens it (25 November: watch mode belongs to
+/// the watch, and its start was on a page of its own). What a start needs, line by line, and a full turn of the crown
+/// to start; while the watch has the pump, to hand back. Extended Mode stays a setting of its own.
+struct WatchModeSheet: View {
+    let manager: UntetheredWatchManager
+    /// After a start: the status page, which shows how it goes.
+    let onStarted: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var turn = 0.0
+    @State private var confirmed = false
+    @FocusState private var crownFocused: Bool
+
+    private var data: UntetheredWatchData { manager.data }
+    private var phase: UntetheredSession.Phase { data.session.phase }
+    private var isPhoneReachable: Bool { WatchState.shared.isReachable }
+    /// No phone nearby, but the phone's copy is good to start from and the watch knows its pod.
+    private var startsWithoutPhone: Bool {
+        !isPhoneReachable && WatchState.shared.allowUntetheredStartWithoutPhone
+            && manager.startWithoutPhoneUnavailable == nil && !manager.standingGrantPodUnknown
+    }
+
+    /// What a turn of the crown does now; nil while it can't.
+    private var crownAction: (prompt: String, run: () -> Void)? {
+        switch phase {
+        case .idle:
+            guard !manager.isBusy, manager.versionMismatch == nil, UntetheredWatchManager.batteryTooLow == nil,
+                  UntetheredWatchManager.sensorNotPaired == nil
+            else { return nil }
+            if isPhoneReachable {
+                return (String(localized: "Turn the crown to start"), { manager.requestStart() })
+            }
+            if startsWithoutPhone {
+                return (String(localized: "Turn the crown to start without the iPhone"), { manager.startWithoutPhone() })
+            }
+            return nil
+        case .active:
+            guard isPhoneReachable else { return nil }
+            return (String(localized: "Turn the crown to hand back"), { manager.end() })
+        case .ending,
+             .preparing,
+             .starting:
+            return nil
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(manager.isActive ? "Watch Mode" : "Start Watch Mode?")
+                    .font(.headline)
+                    .foregroundStyle(Color.untethered)
+                    .frame(maxWidth: .infinity)
+                switch phase {
+                case .idle:
+                    checklist
+                case .preparing,
+                     .starting:
+                    Label("Starting… keep Trio open on the watch.", systemImage: "hourglass").font(.footnote)
+                case .active:
+                    activeStatus
+                case .ending:
+                    Label("Handing back…", systemImage: "iphone").font(.footnote)
+                }
+                if let error = data.lastError, phase == .idle {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                if let action = crownAction {
+                    crown(prompt: action.prompt, run: action.run)
+                }
+                Button("Cancel") { dismiss() }
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(.horizontal, 4)
+        }
+        .onAppear { crownFocused = true }
+    }
+
+    @ViewBuilder private var checklist: some View {
+        if let problem = UntetheredWatchManager.sensorNotPaired {
+            line(ok: false, String(localized: "Sensor"), problem)
+        } else {
+            line(ok: true, String(localized: "Sensor"), String(localized: "The watch reads it."))
+        }
+        if manager.isMeetingPod {
+            line(ok: nil, String(localized: "Pod"), String(localized: "Looking for the pod…"))
+        } else if manager.standingGrantPodUnknown {
+            line(
+                ok: nil,
+                String(localized: "Pod"),
+                String(localized: "The watch doesn't know this pod yet. With the iPhone nearby it finds it at the start.")
+            )
+        } else {
+            line(ok: true, String(localized: "Pod"), String(localized: "The watch knows it."))
+        }
+        if isPhoneReachable {
+            line(ok: true, String(localized: "iPhone"), String(localized: "Nearby."))
+        } else if startsWithoutPhone, let age = manager.standingGrantAge {
+            line(
+                ok: nil,
+                String(localized: "iPhone"),
+                String(localized: "Not nearby. Starts from its copy of \(Int(age / 60)) min ago; it stops dosing once it hears from the watch.")
+            )
+        } else {
+            line(
+                ok: false,
+                String(localized: "iPhone"),
+                String(localized: "Not nearby: bring it close and open Trio on it.")
+                    + (WatchState.shared.allowUntetheredStartWithoutPhone ? " " + (manager.startWithoutPhoneUnavailable ?? "") : "")
+            )
+        }
+        if let battery = UntetheredWatchManager.batteryTooLow {
+            line(ok: false, String(localized: "Battery"), battery)
+        } else {
+            line(ok: true, String(localized: "Battery"), "\(Int(WKInterfaceDevice.current().batteryLevel * 100)) %")
+        }
+        if let mismatch = manager.versionMismatch {
+            line(ok: false, String(localized: "Trio"), mismatch)
+        }
+    }
+
+    @ViewBuilder private var activeStatus: some View {
+        if let at = data.lastLoopAt {
+            line(ok: true, String(localized: "Loop"), String(localized: "Last at \(at.formatted(date: .omitted, time: .shortened))."))
+        }
+        if !isPhoneReachable {
+            line(ok: nil, String(localized: "iPhone"), String(localized: "Not nearby: hand back once it is."))
+        }
+    }
+
+    /// ok: green tick, orange warning, or (nil) a neutral note.
+    private func line(ok: Bool?, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Image(systemName: ok == true ? "checkmark.circle.fill" : ok == false ? "exclamationmark.triangle.fill" : "info.circle")
+                .foregroundStyle(ok == true ? Color.green : ok == false ? Color.orange : Color.secondary)
+                .font(.caption)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(title).font(.caption).bold()
+                Text(detail).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func crown(prompt: String, run: @escaping () -> Void) -> some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Circle().stroke(Color.gray.opacity(0.3), lineWidth: 6)
+                Circle()
+                    .trim(from: 0, to: turn)
+                    .stroke(Color.untethered, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Image(systemName: manager.isActive ? "iphone" : "applewatch")
+                    .font(.title3)
+            }
+            .frame(width: 56, height: 56)
+            .focusable(true)
+            .focused($crownFocused)
+            .digitalCrownRotation(
+                $turn,
+                from: 0,
+                through: 1,
+                by: 0.01,
+                sensitivity: .low,
+                isContinuous: false,
+                isHapticFeedbackEnabled: true
+            )
+            .onChange(of: turn) { _, value in
+                guard value >= 1, !confirmed else { return }
+                confirmed = true
+                WKInterfaceDevice.current().play(.success)
+                let starting = phase == .idle
+                dismiss()
+                run()
+                if starting { onStarted() }
+            }
+            Text(prompt)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
+    }
+}
+
 struct CrownConfirmView: View {
     let title: String
     let message: String

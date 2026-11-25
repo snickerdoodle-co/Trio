@@ -33,6 +33,8 @@ extension Home {
         @State var pendingPump: PumpCatalogEntry?
         @State var pendingCGM: CGMCatalogEntry?
         @State var showSnoozeSheet: Bool = false
+        /// Watch mode's sheet, from a long press on the pump panel.
+        @State var showWatchModeSheet: Bool = false
         @State var showManualGlucose: Bool = false
         @State var showReleaseNotes: Bool = false
         @State var showUntetheredAuditFinding: Bool = false
@@ -307,6 +309,12 @@ extension Home {
             }
             .sheet(isPresented: $state.isLegendPresented) {
                 ChartLegendView(state: state)
+            }
+            .sheet(isPresented: $showWatchModeSheet) {
+                UntetheredStartSheet(
+                    manager: resolver.resolve(UntetheredPhoneManager.self)!,
+                    isPresented: $showWatchModeSheet
+                )
             }
             .sheet(isPresented: $showSnoozeSheet) {
                 SnoozeAlertsSheetView(resolver: resolver, isPresented: $showSnoozeSheet)
@@ -636,48 +644,6 @@ extension Home {
                     comment: "Alert body explaining that quick-pick treatments history is empty"
                 ))
             }
-        }
-    }
-}
-
-/// Checks if the device is using a 24-hour time format.
-func is24HourFormat() -> Bool {
-    let formatter = DateFormatter()
-    formatter.locale = Locale.current
-    formatter.dateStyle = .none
-    formatter.timeStyle = .short
-    let dateString = formatter.string(from: Date())
-
-    return !dateString.contains("AM") && !dateString.contains("PM")
-}
-
-// Helper function to convert a start and end hour to either 24-hour or AM/PM format
-func formatTimeRange(start: String?, end: String?) -> String {
-    guard let start = start, let end = end else {
-        return ""
-    }
-
-    // Check if the format is 24-hour or AM/PM
-    if is24HourFormat() {
-        // Return the original 24-hour format
-        return "\(start)-\(end)"
-    } else {
-        // Convert to AM/PM format using DateFormatter
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH"
-
-        if let startHour = Int(start), let endHour = Int(end) {
-            let startDate = Calendar.current.date(bySettingHour: startHour, minute: 0, second: 0, of: Date()) ?? Date()
-            let endDate = Calendar.current.date(bySettingHour: endHour, minute: 0, second: 0, of: Date()) ?? Date()
-
-            // Customize the format to "2p" or "2a"
-            formatter.dateFormat = "ha"
-            let startFormatted = formatter.string(from: startDate).lowercased().replacingOccurrences(of: "m", with: "")
-            let endFormatted = formatter.string(from: endDate).lowercased().replacingOccurrences(of: "m", with: "")
-
-            return "\(startFormatted)-\(endFormatted)"
-        } else {
-            return ""
         }
     }
 }
