@@ -1378,15 +1378,6 @@ import WatchKit
         )
     }
 
-    /// For the Watch Mode sheet's checklist: the watch has no pairing of its own with the iPhone's sensor yet.
-    static var sensorNotPaired: String? {
-        let reader = WatchG7Reader.shared
-        guard reader.sensorName != nil, reader.isEnabled, !reader.hasWatchKey else { return nil }
-        return String(
-            localized: "The watch isn't paired with this sensor yet. Open the sensor page in Trio on the watch near the sensor and wait for its first reading, then start."
-        )
-    }
-
     func requestStart() {
         guard WatchState.shared.untetheredMode, data.session.phase == .idle, !isBusy else { return }
         // a start by hand shows in the log: on 3 November at 18:04:55 one went out 6 s after Trio opened from the
