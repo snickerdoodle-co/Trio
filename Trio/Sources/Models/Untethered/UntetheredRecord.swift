@@ -24,6 +24,8 @@ struct UntetheredRecord: Codable, Equatable, Identifiable {
         case autosens(Autosens)
         /// The watch's last completed loop; after the hand-back the phone counts its loop age from it.
         case loopCompleted(Date)
+        /// Each loop the watch ran, done or failed (`failure`), for the phone's loop statistics (c229).
+        case loopStat(start: Date, end: Date, failure: String?)
         /// The watch deactivated or discarded the pod: the phone forgets it when it takes the pump back.
         case podEnded(Date)
         /// The pod as the watch last saw it, for the phone's home screen meanwhile.
@@ -57,6 +59,7 @@ struct UntetheredRecord: Codable, Equatable, Identifiable {
     static func tddKey(_ date: Date) -> String { "tdd:\(Int(date.timeIntervalSince1970))" }
     static func autosensKey(_ date: Date) -> String { "autosens:\(Int(date.timeIntervalSince1970))" }
     static func nightscoutKey(_ date: Date) -> String { "ns:\(Int(date.timeIntervalSince1970))" }
+    static func loopStatKey(_ start: Date) -> String { "loopstat:\(Int(start.timeIntervalSince1970))" }
     /// One key: only the newest loop matters.
     static let loopCompletedKey = "loop"
     static let podEndedKey = "podEnded"

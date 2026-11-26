@@ -58,6 +58,7 @@ extension UntetheredPhoneManager {
 /// The toggle in Settings › Apple Watch. It only stays on once the watch has taken the pump.
 struct UntetheredSettingsSection: View {
     @ObservedObject var manager: UntetheredPhoneManager
+    @State private var showWatchModeSheet = false
     @State private var confirmEnd = false
     @State private var confirmForce = false
 
@@ -77,8 +78,9 @@ struct UntetheredSettingsSection: View {
                     Toggle("", isOn: Binding(
                         get: { manager.isWatchShownInCharge },
                         set: { on in
+                            // one way to start, with its checklist: the Watch Mode sheet (Ponytail review)
                             if on {
-                                Task { await manager.start() }
+                                showWatchModeSheet = true
                             } else {
                                 confirmEnd = true
                             }
@@ -115,6 +117,9 @@ struct UntetheredSettingsSection: View {
             Text("The watch hands the pump back as soon as it is reachable.")
         }
         .untetheredForceDialog(isPresented: $confirmForce, manager: manager)
+        .sheet(isPresented: $showWatchModeSheet) {
+            UntetheredStartSheet(manager: manager, isPresented: $showWatchModeSheet)
+        }
     }
 }
 
@@ -508,16 +513,10 @@ struct UntetheredStartSheet: View {
     @State private var confirmEnd = false
     @State private var refusal: String?
 
-    private var watchReachable: Bool {
-        WCSession.isSupported() && WCSession.default.activationState == .activated && WCSession.default.isReachable
-    }
+    private var watchReachable: Bool { manager.watchReachable }
 
     var body: some View {
         NavigationStack {
-            // WatchConnectivity's reachability isn't observable, and it flips as the watch's screen sleeps and wakes:
-            // read again every second (25 November: 'open Trio on the watch' while it was open, until the sheet was
-            // opened again)
-            TimelineView(.periodic(from: .now, by: 1)) { _ in
             List {
                 if !manager.isEnabled {
                     Section {
@@ -583,7 +582,7 @@ struct UntetheredStartSheet: View {
                     }
                 }
             }
-            }
+            .onAppear { manager.refreshWatchReachable() }
             .navigationTitle("Watch Mode")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

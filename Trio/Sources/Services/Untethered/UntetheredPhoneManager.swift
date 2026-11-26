@@ -103,7 +103,7 @@ enum UntetheredGate {
     /// IOB read −1.97 U instead of about +1.8 U, and a 0.5 U bolus went through. Without the records after 2 minutes
     /// the iPhone doses again, as before; the audit books what no record explains.
     static var watchRecordsPending: Bool {
-        guard let point = state.audit else { return false }
+        guard let point = state.audit, point.recordsCover != true else { return false }
         return Date().timeIntervalSince(point.end) < watchRecordsWait
     }
 
@@ -114,7 +114,7 @@ enum UntetheredGate {
     /// phone's reach, its records came 8 minutes after the take-back, and the iPhone looped at 5 minutes on records
     /// 0.24 U short (it set a zero temp).
     static var watchRecordsMissing: Bool {
-        guard let point = state.audit else { return false }
+        guard let point = state.audit, point.recordsCover != true else { return false }
         return Date().timeIntervalSince(point.end) < 30 * 60
     }
 
@@ -361,6 +361,15 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
 
     var isWatchInCharge: Bool { !state.session.isIdle }
 
+    /// Trio open on the watch (WatchConnectivity's reachability), for the Watch Mode sheet. It flips as the watch's
+    /// screen sleeps and wakes; AppleWatchManager says so at each change.
+    @Published private(set) var watchReachable = false
+
+    @MainActor func refreshWatchReachable() {
+        watchReachable = WCSession.isSupported() && WCSession.default.activationState == .activated && WCSession.default
+            .isReachable
+    }
+
     // MARK: - Ready for a forgotten iPhone
 
     enum Readiness: Equatable {
@@ -381,9 +390,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         let age = Date().timeIntervalSince(report.at)
         if age > Self.readinessMaxAge { return .unknown(hours: Int(age / 3600)) }
         var missing: [String] = []
-        // the copy the watch answered for must be of this pod: older, it was of the pod before
-        let pod = (apsManager.pumpManager as? OmniPumpManager)?.state.podState?.activatedAt
-        if !report.podKnown || (pod.map { (report.grantIssuedAt ?? .distantPast) < $0 } ?? false) {
+        if watchKnowsPod == false {
             missing.append(String(localized: "the watch hasn't met this pod yet: open Trio on the watch near the pod"))
         }
         let g7 = fetchGlucoseManager.cgmManager as? G7CGMManager
@@ -408,10 +415,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     func letWatchMeetPodIfNeeded() {
         // a report from while the watch had the pump names no standing grant, so it says nothing about the pod
         // (25 November, 16:10: "hasn't met this pod yet" for 2 min after a 5-hour session)
-        guard let pump = apsManager.pumpManager as? OmniPumpManager, let activated = pump.state.podState?.activatedAt,
-              let report = WatchReadiness.latest, report.grantIssuedAt != nil
-        else { return }
-        let met = report.podKnown && (report.grantIssuedAt ?? .distantPast) >= activated
+        guard let pump = apsManager.pumpManager as? OmniPumpManager, let met = watchKnowsPod else { return }
         let letGo = isEnabled && settingsManager.settings.allowUntetheredStartWithoutPhoneWatch && !isWatchInCharge && !met
         if letGo != lettingWatchMeetPod {
             debug(.watch, letGo ? "Untethered: the watch hasn't met this pod yet — the iPhone leaves its link free" :
@@ -430,7 +434,8 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         pump.acceptPartnerSessionCounter(counter)
     }
 
-    /// Whether the watch has met the current pod, by its last report; nil without a report or a pod.
+    /// Whether the watch has met the current pod, by its last report; nil without a report or a pod. The copy the watch
+    /// answered for must be of this pod: older, it was of the pod before.
     var watchKnowsPod: Bool? {
         guard let report = WatchReadiness.latest, report.grantIssuedAt != nil,
               let activated = (apsManager.pumpManager as? OmniPumpManager)?.state.podState?.activatedAt
@@ -1128,6 +1133,7 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
     }
 
     @MainActor func reachabilityChanged() {
+        refreshWatchReachable()
         guard WCSession.default.isReachable else { return }
         switch state.session.phase {
         case .ending: send(.endRequest, epoch: state.session.epoch)
@@ -2017,6 +2023,12 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             )
             // to the hundredth: the records' sum came out as 0.000050868113835652676 U after a look at the pod
             let rounded = { (value: Decimal) in value.formatted(.number.precision(.fractionLength(0 ... 2))) }
+            // Records that already explain all the pod delivered can't lack insulin: no wait for the watch's
+            // (c227; 26 November, second tester: after the watch's looks at the pod, no session, pump 0 U and records
+            // 0 U, and two boluses were refused, the SMBs held for 30 minutes)
+            if !historyComplete, point.delivered <= expected + 0.05 {
+                UntetheredGate.update { if $0.audit?.epoch == point.epoch { $0.audit?.recordsCover = true } }
+            }
             let notes = [cause, historyComplete ? nil : "watch history incomplete"].compactMap { $0 }
             debug(
                 .watch,
@@ -2467,9 +2479,40 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
         case let .loopCompleted(date):
             // the loop's age and the interval to the next loop go on from the watch's last loop
             await MainActor.run { self.apsManager.adoptLoop(at: date) }
+        case let .loopStat(start, end, failure):
+            await storeWatchLoopStat(start: start, end: end, failure: failure)
         case let .nightscoutUploaded(date):
             // the loop came in an earlier batch than this note: marked now, unless the phone uploaded it already
             await markDeterminationUploadedByWatch(deliveredAt: date)
+        }
+    }
+
+    /// A loop of the watch as one of the phone's own in the loop statistics, once (c229: the statistics missed every
+    /// hour of watch mode). Its interval from the loop before it, the phone's or the watch's.
+    private func storeWatchLoopStat(start: Date, end: Date, failure: String?) async {
+        let context = CoreDataStack.shared.newTaskContext()
+        context.name = "untetheredLoopStat"
+        await context.perform {
+            let same = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
+            same.predicate = NSPredicate(format: "start == %@", start as NSDate)
+            guard (try? context.count(for: same)) == 0 else { return }
+            let before = LoopStatRecord.fetchRequest() as NSFetchRequest<LoopStatRecord>
+            before.predicate = NSPredicate(format: "end < %@", start as NSDate)
+            before.sortDescriptors = [NSSortDescriptor(key: "end", ascending: false)]
+            before.fetchLimit = 1
+            let record = LoopStatRecord(context: context)
+            record.start = start
+            record.end = end
+            record.loopStatus = failure ?? "Success"
+            record.duration = (end.timeIntervalSince(start) / 60 * 100).rounded() / 100
+            if let previousEnd = (try? context.fetch(before))?.first?.end {
+                record.interval = (start.timeIntervalSince(previousEnd) / 60 * 10).rounded() / 10
+            }
+            do {
+                try context.save()
+            } catch {
+                warning(.storage, "Untethered: saving the watch's loop statistics failed", error: error)
+            }
         }
     }
 

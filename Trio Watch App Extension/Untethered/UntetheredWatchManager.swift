@@ -2081,6 +2081,8 @@ extension UntetheredWatchManager {
     /// left behind a few minutes after a look wait 34 minutes for the watch (31 October: looked at 08:48 with the phone
     /// still looping, airplane mode at 08:54, the pause from 08:58 kept the 09:18 reading from a look).
     static let fallbackLookPause: TimeInterval = 9 * 60
+    /// When the last look at the pod read it, kept over a new start of the app (c228).
+    static let lastLookAtKey = "untethered.fallbackLastLookAt"
     static let fallbackHandbackGrace: TimeInterval = 60
     static let fallbackHandbackRepeat: TimeInterval = 5 * 60
     private static let fallbackEpochKey = "untethered.fallbackEpoch"
@@ -2272,7 +2274,9 @@ extension UntetheredWatchManager {
     /// pod since (the pod resynchronizes the session counter, `lastForeignSessionAt`).
     func lookAtPod(readingAt: Date? = nil) async -> PodLook {
         let since = fallbackWitness?.at
-        if let since, Date().timeIntervalSince(since) < Self.fallbackWitnessGap { return .tooSoon }
+        // the last look also when the app was started again since (c228): its manager is gone, its time isn't
+        let lastLook = since ?? UserDefaults.standard.object(forKey: Self.lastLookAtKey) as? Date
+        if let lastLook, Date().timeIntervalSince(lastLook) < Self.fallbackWitnessGap { return .tooSoon }
         let pump: PumpManager & ExclusiveDeviceControl
         // the copy the manager was made from: the takeover goes on with it only if it starts from the same
         var issuedAt = fallbackWitness?.issuedAt
@@ -2333,9 +2337,22 @@ extension UntetheredWatchManager {
             return .notReached("no answer in \(Int(Date().timeIntervalSince(started))) s")
         }
         fallbackWitness = (pump, Date(), issuedAt)
+        UserDefaults.standard.set(Date(), forKey: Self.lastLookAtKey)
         // the handle it found is kept, as a session keeps its own: the next look and a takeover connect directly
         if let local = Self.plist(pump.localState) { store.update { $0.localStates[pump.pluginIdentifier] = local } }
-        guard let since else { return .firstLook }
+        guard let since else {
+            // c228, 26 November, second tester: the watch app started again 5 minutes after a look, and its next
+            // look counted as a first one, though the iPhone had taken the pump back in between: that look made the
+            // iPhone refuse a bolus 4 s later and ask again for 3 minutes. A new manager has no look to compare with,
+            // but the pod has: a session by another controller since this watch's own last one shows as a resync
+            // (OmnipodKit keeps the last counter the pod accepted from this watch).
+            if let lastLook, Date().timeIntervalSince(lastLook) < 15 * 60,
+               let foreign = pump.lastForeignSessionAt, foreign >= started
+            {
+                return .phoneUsedPod(foreign)
+            }
+            return .firstLook
+        }
         if let foreign = pump.lastForeignSessionAt, foreign > since { return .phoneUsedPod(foreign) }
         return .nobody
     }

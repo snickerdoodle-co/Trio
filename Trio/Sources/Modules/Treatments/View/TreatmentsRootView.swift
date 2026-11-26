@@ -640,8 +640,12 @@ extension Treatments {
                 return (false, "", .primary)
             }
 
+            // after a take-back, while the records the watch still owes may hold insulin the iPhone doesn't count
+            // (c217, c227): the loop gives no SMB then; a bolus by hand goes, with this said (Ponytail review)
             let warningMessage = isGlucoseVeryLow ? String(localized: "Glucose is very low.") :
                 isForecastVeryLow ? String(localized: "Glucose forecast is very low.") :
+                UntetheredGate.watchRecordsMissing ?
+                String(localized: "The watch's last records aren't in yet: insulin on board may be too low.") :
                 ""
 
             let warningColor: Color = isGlucoseVeryLow ? .red : colorScheme == .dark ? .orange : .accentColor

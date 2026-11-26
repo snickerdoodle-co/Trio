@@ -1319,7 +1319,7 @@ struct WatchModeSheet: View {
     }
 
     @ViewBuilder private var activeStatus: some View {
-        if let at = data.lastLoopAt {
+        if let at = data.lastLoopDate {
             line(ok: true, String(localized: "Loop"), String(localized: "Last at \(at.formatted(date: .omitted, time: .shortened))."))
         }
         if !isPhoneReachable {

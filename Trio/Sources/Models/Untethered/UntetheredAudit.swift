@@ -121,6 +121,8 @@ struct UntetheredAuditPoint: Codable, Equatable {
     let startUnits: Double
     let end: Date
     let endUnits: Double
+    /// The records already explain all the pod delivered in the span (c227): no insulin can be missing from them.
+    var recordsCover: Bool?
 
     var delivered: Decimal { Decimal(endUnits - startUnits) }
 }
