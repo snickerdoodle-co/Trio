@@ -975,6 +975,8 @@ import WatchKit
     }
 
     private func fire(_ kind: AlertKind, reading: WatchG7Reading) {
+        // as on the phone: a snooze, set on either, silences all but urgent low, which only the watch can sound now
+        guard kind == .urgentLow || WatchState.shared.snoozeUntilDate <= Date() else { return }
         let key = Key.lastAlert + kind.rawValue
         if let last = defaults.object(forKey: key) as? Date, Date().timeIntervalSince(last) < kind.repeatInterval {
             return

@@ -2642,8 +2642,20 @@ extension UntetheredWatchManager {
             id: Self.noReadingsID,
             title: Self.noReadingsTitle,
             body: Self.noReadingsBody(minutes: Int(Self.noReadingsAfter / 60)),
-            after: lastReading.addingTimeInterval(Self.noReadingsAfter).timeIntervalSinceNow
+            after: Self.pastSnooze(lastReading.addingTimeInterval(Self.noReadingsAfter).timeIntervalSinceNow)
         )
+    }
+
+    /// A booked loop or sensor alarm that would sound during a snooze sounds as it ends instead, if still due then.
+    private static func pastSnooze(_ delay: TimeInterval) -> TimeInterval {
+        max(delay, WatchState.shared.snoozeUntilDate.timeIntervalSinceNow)
+    }
+
+    /// A snooze set or ended, on either device: the booked loop and sensor alarms move past it, or back.
+    func rebookAlarmsForSnooze() {
+        guard isActive else { return }
+        if !data.podEnded { scheduleNotLoopingAlert(from: loopReference ?? Date()) }
+        scheduleNoReadingsAlert(from: sensorGlucose.map(\.dateString).max() ?? Date())
     }
 
     static let notLoopingID = "untethered.loop"
@@ -2672,7 +2684,7 @@ extension UntetheredWatchManager {
             id: Self.notLoopingID,
             title: Self.notLoopingTitle,
             body: Self.notLoopingBody(minutes: Int(Self.notLoopingAfter / 60)),
-            after: lastLoop.addingTimeInterval(Self.notLoopingAfter).timeIntervalSinceNow
+            after: Self.pastSnooze(lastLoop.addingTimeInterval(Self.notLoopingAfter).timeIntervalSinceNow)
         )
         for (index, extra) in Self.notLoopingRepeats.enumerated() {
             let after = Self.notLoopingAfter + extra
@@ -2682,7 +2694,7 @@ extension UntetheredWatchManager {
                 id: Self.notLoopingID + ".again\(index + 1)",
                 title: Self.notLoopingTitle,
                 body: Self.notLoopingBody(minutes: Int(after / 60)),
-                after: lastLoop.addingTimeInterval(after).timeIntervalSinceNow
+                after: Self.pastSnooze(lastLoop.addingTimeInterval(after).timeIntervalSinceNow)
             )
         }
     }
@@ -2715,6 +2727,8 @@ extension UntetheredWatchManager {
 
     private func alarm(_ kind: String, title: String, body: String, every interval: TimeInterval) {
         guard (Self.lastAlarm[kind] ?? .distantPast).addingTimeInterval(interval) < Date() else { return }
+        // as on the phone: a snooze, set on either, silences all but urgent low
+        guard kind == "urgentLow" || WatchState.shared.snoozeUntilDate <= Date() else { return }
         Self.lastAlarm[kind] = Date()
         notify(id: Self.notificationPrefix + kind, title: title, body: body)
         // felt at once while the app runs, as the watch's G7 reader alerts; the notification may wait for the screen

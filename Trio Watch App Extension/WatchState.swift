@@ -33,7 +33,13 @@ import WatchKit
     var lastLoopTime: String? = "--"
     var overridePresets: [OverridePresetWatch] = []
     var tempTargetPresets: [TempTargetPresetWatch] = []
-    var snoozeUntilDate: Date = .distantPast
+    var snoozeUntilDate: Date = .distantPast {
+        // the watch's own booked alarms follow a snooze set on either device
+        didSet {
+            guard snoozeUntilDate != oldValue else { return }
+            DispatchQueue.main.async { UntetheredWatchManager.shared.rebookAlarmsForSnooze() }
+        }
+    }
 
     // Devices page (PeripheralsView): pump and sensor lifetime from the phone; nil where the hardware reports none
     var pumpName: String?

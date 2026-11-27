@@ -1352,8 +1352,11 @@ struct WatchModeSheet: View {
                     .font(.title3)
             }
             .frame(width: 56, height: 56)
+            .contentShape(Circle())
             .focusable(true)
             .focused($crownFocused)
+            // scrolling the page by touch takes the crown for the page; a tap gives it back to the ring
+            .onTapGesture { crownFocused = true }
             .digitalCrownRotation(
                 $turn,
                 from: 0,
@@ -1372,7 +1375,7 @@ struct WatchModeSheet: View {
                 run()
                 if starting { onStarted() }
             }
-            Text(prompt)
+            Text(crownFocused ? prompt : String(localized: "Tap the circle, then turn the crown"))
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1412,8 +1415,10 @@ struct CrownConfirmView: View {
                         .font(.title3)
                 }
                 .frame(width: 64, height: 64)
+                .contentShape(Circle())
                 .focusable(true)
                 .focused($crownFocused)
+                .onTapGesture { crownFocused = true }
                 .digitalCrownRotation(
                     $turn,
                     from: 0,
@@ -1423,7 +1428,7 @@ struct CrownConfirmView: View {
                     isContinuous: false,
                     isHapticFeedbackEnabled: true
                 )
-                Text(prompt)
+                Text(crownFocused ? prompt : String(localized: "Tap the circle, then turn the crown"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Cancel") { dismiss() }
