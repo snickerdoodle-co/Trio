@@ -2031,7 +2031,7 @@ extension UntetheredWatchManager: CGMManagerDelegate {
         for tap in 0 ..< taps {
             DispatchQueue.main.asyncAfter(deadline: .now() + Double(tap)) { WKInterfaceDevice.current().play(.failure) }
         }
-        Task { await WatchLogger.shared.log("⌚️ Untethered alarm: \(Self.podLinkTitle) after \(minutes) min", force: true) }
+        Task { await WatchLogger.shared.log("⌚️ Watch mode alarm: \(Self.podLinkTitle) after \(minutes) min", force: true) }
         reconnectPod(pump, minutes: minutes, now: now)
     }
 
@@ -2732,8 +2732,8 @@ extension UntetheredWatchManager {
         Self.lastAlarm[kind] = Date()
         notify(id: Self.notificationPrefix + kind, title: title, body: body)
         // felt at once while the app runs, as the watch's G7 reader alerts; the notification may wait for the screen
-        WKInterfaceDevice.current().play(kind == "high" ? .notification : .failure)
-        Task { await WatchLogger.shared.log("⌚️ Untethered alarm: \(title) \(body)", force: true) }
+        Self.playAlarmTaps(kind)
+        Task { await WatchLogger.shared.log("⌚️ Watch mode alarm: \(title) \(body)", force: true) }
     }
 
     /// The alarms that mean nobody is looping or the user is in danger: critical with Settings › Notifications ›
@@ -3179,5 +3179,31 @@ extension UntetheredWatchManager {
             )
         }
         runLoop(.podBack)
+    }
+}
+
+extension UntetheredWatchManager {
+    /// Alarms told apart by feel (28 November). Urgent low: three strong taps, a pause, again, for about 30 s or until
+    /// Trio is in front; it comes back every 5 minutes while it lasts. High: two short taps. The others: one strong
+    /// tap. Felt while the app runs: in watch mode always, outside it as long as watchOS keeps the app awake.
+    static func playAlarmTaps(_ kind: String) {
+        let device = WKInterfaceDevice.current()
+        switch kind {
+        case "urgentLow":
+            for burst in 0 ..< 8 {
+                for tap in 0 ..< 3 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(burst) * 3.8 + Double(tap) * 0.6) {
+                        // seen: the rest would only buzz on the open app
+                        guard burst == 0 || WKApplication.shared().applicationState != .active else { return }
+                        device.play(.failure)
+                    }
+                }
+            }
+        case "high":
+            device.play(.notification)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { device.play(.notification) }
+        default:
+            device.play(.failure)
+        }
     }
 }

@@ -173,6 +173,17 @@ extension PluginSource: CGMManagerDelegate {
                 }
             }
 
+            // Jonas Björkert's patch (bjorkert/Trio patches/unreliable_glucose_upload.patch): the G7's unreliable
+            // readings, live and backfilled, to Nightscout for LoopFollow
+            if let g7 = manager as? G7CGMManager {
+                let unreliable = g7.takeUnreliableReadings()
+                if !unreliable.isEmpty, let settings = self.glucoseManager?.settingsManager?.settings,
+                   settings.isUploadEnabled, settings.uploadGlucose
+                {
+                    UnreliableGlucoseUploader.upload(unreliable.map { (date: $0.date, mgdl: Int($0.glucose)) })
+                }
+            }
+
             self.glucoseManager?.reportCGMSensorObservation(self.currentSensorObservation())
 
             self.publishCGMStatus()
@@ -474,6 +485,75 @@ final class UnsureGlucoseStore: ObservableObject {
             self.readings = (self.readings + [reading])
                 .filter { now.timeIntervalSince($0.date) < Self.keep }
                 .sorted { $0.date < $1.date }
+        }
+    }
+}
+
+/// Uploads the G7 readings the sensor marks unreliable, live and backfilled, as "Unreliable Glucose" treatments, which
+/// LoopFollow shows as hollow orange dots. Trio itself never stores, shows or uses them.
+enum UnreliableGlucoseUploader {
+    private static let uploadedKey = "trio.unreliableGlucoseUploadedDates"
+    private static let remembered: TimeInterval = 24 * 60 * 60
+
+    private struct Treatment: Encodable {
+        let eventType = "Unreliable Glucose"
+        let enteredBy = "Trio"
+        let glucoseType = "Sensor"
+        let units = "mg/dl"
+        let glucose: Int
+        let notes: String
+        let created_at: String
+    }
+
+    /// Called on PluginSource's process queue only.
+    static func upload(_ readings: [(date: Date, mgdl: Int)]) {
+        let cutoff = Date().addingTimeInterval(-remembered).timeIntervalSince1970
+        var uploaded = Set((UserDefaults.standard.array(forKey: uploadedKey) as? [Double] ?? []).filter { $0 > cutoff })
+
+        var fresh: [(date: Date, mgdl: Int)] = []
+        for reading in readings.sorted(by: { $0.date < $1.date }) {
+            let seconds = reading.date.timeIntervalSince1970.rounded()
+            guard seconds > cutoff, uploaded.insert(seconds).inserted else { continue }
+            fresh.append(reading)
+        }
+        UserDefaults.standard.set(Array(uploaded), forKey: uploadedKey)
+        guard !fresh.isEmpty else { return }
+
+        let keychain = BaseKeychain()
+        guard let urlString = keychain.getValue(String.self, forKey: NightscoutConfig.Config.urlKey),
+              let url = URL(string: urlString),
+              let secret = keychain.getValue(String.self, forKey: NightscoutConfig.Config.secretKey)
+        else {
+            debug(.nightscout, "Unreliable G7 readings not uploaded: Nightscout is not configured")
+            return
+        }
+
+        let formatter = ISO8601DateFormatter()
+        let treatments = fresh.map {
+            Treatment(
+                glucose: $0.mgdl,
+                notes: "Unreliable reading (sensor issue): \($0.mgdl) mg/dL",
+                created_at: formatter.string(from: $0.date)
+            )
+        }
+        let summary = fresh.map { "\($0.mgdl)" }.joined(separator: ", ")
+
+        Task.detached(priority: .utility) {
+            do {
+                var request = URLRequest(url: url.appendingPathComponent("api/v1/treatments.json"))
+                request.httpMethod = "POST"
+                request.timeoutInterval = 30
+                request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
+                request.httpBody = try JSONEncoder().encode(treatments)
+                let (_, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, 200 ..< 300 ~= http.statusCode else {
+                    throw URLError(.badServerResponse)
+                }
+                debug(.nightscout, "Uploaded unreliable G7 readings: \(summary) mg/dL")
+            } catch {
+                debug(.nightscout, "Unreliable G7 reading upload failed: \(error.localizedDescription)")
+            }
         }
     }
 }

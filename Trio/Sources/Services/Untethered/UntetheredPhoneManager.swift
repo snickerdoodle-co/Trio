@@ -856,6 +856,17 @@ final class UntetheredPhoneManager: ObservableObject, Injectable {
             try preflight()
             // a pump the phone can't reach now is one the watch can't reach after the hand-over either
             guard await pumpAnswers() else {
+                // refused, not unreachable: the pod shows another controller's session (27 November, third tester:
+                // five starts read "doesn't answer"). Settled as after a refused loop; the start waits for that.
+                if let control = apsManager.pumpManager as? ExclusiveDeviceControl,
+                   let since = control.refusesForeignSessionsSince, let foreign = control.lastForeignSessionAt,
+                   foreign > since
+                {
+                    Task { @MainActor in await self.checkForeignSession() }
+                    throw UntetheredError.unavailable(
+                        String(localized: "The iPhone found another session on the pod and is asking the watch about it. Try again in a few minutes.")
+                    )
+                }
                 throw UntetheredError.unavailable(
                     String(localized: "The pump doesn't answer. Keep the phone close to the pod and try again.")
                 )

@@ -1000,7 +1000,7 @@ import WatchKit
             trigger: nil
         )
         UNUserNotificationCenter.current().add(request)
-        WKInterfaceDevice.current().play(kind == .high ? .notification : .failure)
+        UntetheredWatchManager.playAlarmTaps(kind.rawValue)
         appendLog("Alert: \(kind.title) \(value)")
     }
 
